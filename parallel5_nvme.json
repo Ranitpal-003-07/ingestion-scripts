@@ -1,0 +1,25 @@
+{
+  "label": "parallel",
+  "profile": "sql",
+  "requests": 30,
+  "concurrency": 10,
+  "wall_seconds": 13.596,
+  "throughput_rps": 2.21,
+  "ok": 30,
+  "failed": 0,
+  "success_rate": 100.0,
+  "latency_ms": {
+    "min": 34.7,
+    "p50": 1449.6,
+    "p90": 12113.0,
+    "p95": 13097.9,
+    "p99": 13359.3,
+    "max": 13409.5,
+    "mean": 4351.0
+  },
+  "status_codes": {
+    "200": 30
+  },
+  "errors_sample": [],
+  "total_hits": 19
+}

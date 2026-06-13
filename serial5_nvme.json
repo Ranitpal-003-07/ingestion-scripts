@@ -1,0 +1,25 @@
+{
+  "label": "serial",
+  "profile": "sql",
+  "requests": 30,
+  "concurrency": 10,
+  "wall_seconds": 13.39,
+  "throughput_rps": 2.24,
+  "ok": 30,
+  "failed": 0,
+  "success_rate": 100.0,
+  "latency_ms": {
+    "min": 36.6,
+    "p50": 4430.1,
+    "p90": 7306.8,
+    "p95": 7377.1,
+    "p99": 7418.3,
+    "max": 7434.8,
+    "mean": 4219.7
+  },
+  "status_codes": {
+    "200": 30
+  },
+  "errors_sample": [],
+  "total_hits": 17
+}

@@ -1,0 +1,29 @@
+{
+  "label": "parallel",
+  "profile": "sql",
+  "requests": 300,
+  "concurrency": 30,
+  "wall_seconds": 362.523,
+  "throughput_rps": 0.83,
+  "ok": 298,
+  "failed": 2,
+  "success_rate": 99.33,
+  "latency_ms": {
+    "min": 117.1,
+    "p50": 30321.5,
+    "p90": 83466.6,
+    "p95": 96701.0,
+    "p99": 115027.8,
+    "max": 120004.2,
+    "mean": 35346.4
+  },
+  "status_codes": {
+    "200": 298,
+    "0": 2
+  },
+  "errors_sample": [
+    "timeout: timed out",
+    "timeout: timed out"
+  ],
+  "total_hits": 4040
+}

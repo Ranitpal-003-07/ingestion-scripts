@@ -1,0 +1,25 @@
+{
+  "label": "serial",
+  "profile": "logs",
+  "requests": 300,
+  "concurrency": 300,
+  "wall_seconds": 30.366,
+  "throughput_rps": 9.88,
+  "ok": 300,
+  "failed": 0,
+  "success_rate": 100.0,
+  "latency_ms": {
+    "min": 31.8,
+    "p50": 16493.3,
+    "p90": 28080.5,
+    "p95": 28989.3,
+    "p99": 30144.7,
+    "max": 30233.4,
+    "mean": 16418.7
+  },
+  "status_codes": {
+    "200": 300
+  },
+  "errors_sample": [],
+  "total_hits": 1600
+}
