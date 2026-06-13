@@ -10,7 +10,7 @@ HEADERS = {
     "User-Agent": "MetricsGenerator/1.0",
 }
 
-LOGS_PER_SECOND = 30
+LOGS_PER_SECOND = 10
 
 SERVICES = ["checkout-api", "search-api", "auth-service", "order-processor", "api-gateway", "worker-queue"]
 ENVIRONMENT = "staging"
