@@ -3,7 +3,7 @@ import time
 
 import requests
 
-ENDPOINT = "http://staging.ctrlb.dev:8080/api/default/suppressed_insights_test/_json_evolving"
+ENDPOINT = "http://staging.ctrlb.dev:8080/api/default/patition_key_test/_json_evolving"
 
 HEADERS = {
     "Content-Type": "application/json",
