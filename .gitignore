@@ -4,3 +4,5 @@ __pycache__/
 .env
 temp.json
 test_s3
+s3_copy
+sqs-poll
