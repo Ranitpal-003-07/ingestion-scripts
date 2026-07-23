@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flask-instrumentation-test
+  labels:
+    app: flask-instrumentation-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flask-instrumentation-test
+  template:
+    metadata:
+      labels:
+        app: flask-instrumentation-test
+    spec:
+      containers:
+        - name: flask
+          image: flask-otel-test:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          envFrom:
+            - configMapRef:
+                name: otel-config
+            - secretRef:
+                name: otel-secret
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Expand $(NAMESPACE) / $(POD_NAME) after those vars are set
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "k8s.namespace.name=$(NAMESPACE),k8s.pod.name=$(POD_NAME),deployment.environment=k8s"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flask-instrumentation-test
+  labels:
+    app: flask-instrumentation-test
+spec:
+  type: ClusterIP
+  selector:
+    app: flask-instrumentation-test
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

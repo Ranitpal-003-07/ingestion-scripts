@@ -1,0 +1,15 @@
+.venv
+.venv314
+__pycache__
+*.pyc
+.env
+.git
+*.md
+.dockerignore
+Dockerfile
+uwsgi.ini
+gunicorn*.conf.py
+celery_app.py
+run*.sh
+enqueue*.sh
+hit-endpoints.sh
