@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# CtrlB Flask guide — zero-code auto-instrumentation (no OTEL code in app.py).
+# CtrlB Flask guide — traces only.
 #
 #   OTEL_EXPORTER=otlp \
 #   OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
 #   OTEL_SERVICE_NAME=<service_name> \
-#   OTEL_EXPORTER_OTLP_ENDPOINT=https://<INGESTION_HOST>/api/default \
-#   OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=https://<INGESTION_HOST>/api/default/<STREAM_NAME>/_otel/v1/logs \
+#   OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://<INGESTION_HOST>/api/default/v1/traces \
+#   OTEL_METRICS_EXPORTER=none \
+#   OTEL_LOGS_EXPORTER=none \
 #   OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic <API_TOKEN>,stream-name=<STREAM_NAME>" \
 #   opentelemetry-instrument flask run -p 8080 --no-reload
 set -euo pipefail
@@ -43,13 +44,18 @@ export FLASK_APP="${FLASK_APP:-app.py}"
 export OTEL_EXPORTER=otlp
 export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 export OTEL_SERVICE_NAME="${STREAM_NAME}"
-export OTEL_EXPORTER_OTLP_ENDPOINT="https://${INGESTION_HOST}/api/default"
-export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT="https://${INGESTION_HOST}/api/default/${STREAM_NAME}/_otel/v1/logs"
+export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT="https://${INGESTION_HOST}/api/default/v1/traces"
+export OTEL_METRICS_EXPORTER=none
+export OTEL_LOGS_EXPORTER=none
 export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic ${API_TOKEN},stream-name=${STREAM_NAME}"
+unset OTEL_EXPORTER_OTLP_ENDPOINT 2>/dev/null || true
+unset OTEL_EXPORTER_OTLP_LOGS_ENDPOINT 2>/dev/null || true
 
-echo "flask_instrumentation_test (CtrlB Flask guide)"
+echo "flask_instrumentation_test (CtrlB Flask guide — traces only)"
 echo "  OTEL_SERVICE_NAME=${OTEL_SERVICE_NAME}"
-echo "  OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT}"
+echo "  OTEL_METRICS_EXPORTER=${OTEL_METRICS_EXPORTER}"
+echo "  OTEL_LOGS_EXPORTER=${OTEL_LOGS_EXPORTER}"
+echo "  OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT}"
 echo "  launcher: opentelemetry-instrument flask run -p ${PORT} --no-reload"
 echo
 

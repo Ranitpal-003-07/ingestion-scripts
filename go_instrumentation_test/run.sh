@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
-# Guide Step 3 — configure OTLP exporter for CtrlB, then go run .
+# CtrlB Go guide — logs only (otelslog bridge).
+#
+#   OTEL_EXPORTER=otlp \
+#   OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
+#   OTEL_SERVICE_NAME=<service_name> \
+#   OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=https://<INGESTION_HOST>/api/default/<STREAM_NAME>/_otel/v1/logs \
+#   OTEL_TRACES_EXPORTER=none \
+#   OTEL_METRICS_EXPORTER=none \
+#   OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic <API_TOKEN>,stream-name=<STREAM_NAME>" \
+#   go run .
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -21,23 +30,22 @@ fi
 
 export OTEL_EXPORTER=otlp
 export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
-export OTEL_TRACES_EXPORTER=otlp
-export OTEL_METRICS_EXPORTER=otlp
-export OTEL_LOGS_EXPORTER=otlp
-export OTEL_METRIC_EXPORT_INTERVAL="${OTEL_METRIC_EXPORT_INTERVAL:-10000}"
 export OTEL_SERVICE_NAME="${STREAM_NAME}"
-export OTEL_EXPORTER_OTLP_ENDPOINT="https://${INGESTION_HOST}/api/default"
 export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT="https://${INGESTION_HOST}/api/default/${STREAM_NAME}/_otel/v1/logs"
+export OTEL_TRACES_EXPORTER=none
+export OTEL_METRICS_EXPORTER=none
+export OTEL_LOGS_EXPORTER=otlp
 export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic ${API_TOKEN},stream-name=${STREAM_NAME}"
-# Metrics use base endpoint + /v1/metrics (stream-specific metrics URL returns 404)
-unset OTEL_EXPORTER_OTLP_METRICS_ENDPOINT 2>/dev/null || true
+unset OTEL_EXPORTER_OTLP_ENDPOINT 2>/dev/null || true
+unset OTEL_EXPORTER_OTLP_TRACES_ENDPOINT 2>/dev/null || true
 
-echo "go_instrumentation_test"
+echo "go_instrumentation_test (CtrlB Go guide — logs only)"
 echo "  OTEL_SERVICE_NAME=${OTEL_SERVICE_NAME}"
 echo "  OTEL_TRACES_EXPORTER=${OTEL_TRACES_EXPORTER}"
 echo "  OTEL_METRICS_EXPORTER=${OTEL_METRICS_EXPORTER}"
 echo "  OTEL_LOGS_EXPORTER=${OTEL_LOGS_EXPORTER}"
-echo "  OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT}"
+echo "  OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=${OTEL_EXPORTER_OTLP_LOGS_ENDPOINT}"
+echo "  launcher: go run ."
 echo
 
 exec go run .

@@ -60,9 +60,11 @@ func loadOtelEnv() {
 	setDefaultEnv("OTEL_EXPORTER", "otlp")
 	setDefaultEnv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
 	setDefaultEnv("OTEL_SERVICE_NAME", streamName)
-	setDefaultEnv("OTEL_EXPORTER_OTLP_ENDPOINT", fmt.Sprintf("https://%s/api/default", ingestionHost))
 	setDefaultEnv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
 		fmt.Sprintf("https://%s/api/default/%s/_otel/v1/logs", ingestionHost, streamName))
+	setDefaultEnv("OTEL_TRACES_EXPORTER", "none")
+	setDefaultEnv("OTEL_METRICS_EXPORTER", "none")
+	setDefaultEnv("OTEL_LOGS_EXPORTER", "otlp")
 	setDefaultEnv("OTEL_EXPORTER_OTLP_HEADERS",
 		fmt.Sprintf("Authorization=Basic %s,stream-name=%s", apiToken, streamName))
 }

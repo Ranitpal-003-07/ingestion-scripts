@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# CtrlB Django guide — zero-code auto-instrumentation (no OTEL code in views).
+# CtrlB Django guide — logs only (Step 3).
 #
-#   DJANGO_SETTINGS_MODULE=config.settings \
+#   DJANGO_SETTINGS_MODULE=myproject.settings \
 #   OTEL_EXPORTER=otlp \
 #   OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
 #   OTEL_SERVICE_NAME=<service_name> \
-#   OTEL_EXPORTER_OTLP_ENDPOINT=https://<INGESTION_HOST>/api/default \
 #   OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=https://<INGESTION_HOST>/api/default/<STREAM_NAME>/_otel/v1/logs \
+#   OTEL_TRACES_EXPORTER=none \
+#   OTEL_METRICS_EXPORTER=none \
 #   OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic <API_TOKEN>,stream-name=<STREAM_NAME>" \
 #   opentelemetry-instrument python manage.py runserver --noreload
 #
@@ -45,14 +46,21 @@ export DJANGO_SETTINGS_MODULE=config.settings
 export OTEL_EXPORTER=otlp
 export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 export OTEL_SERVICE_NAME="${STREAM_NAME}"
-export OTEL_EXPORTER_OTLP_ENDPOINT="https://${INGESTION_HOST}/api/default"
 export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT="https://${INGESTION_HOST}/api/default/${STREAM_NAME}/_otel/v1/logs"
+export OTEL_TRACES_EXPORTER=none
+export OTEL_METRICS_EXPORTER=none
+export OTEL_LOGS_EXPORTER=otlp
 export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic ${API_TOKEN},stream-name=${STREAM_NAME}"
+unset OTEL_EXPORTER_OTLP_ENDPOINT 2>/dev/null || true
+unset OTEL_EXPORTER_OTLP_TRACES_ENDPOINT 2>/dev/null || true
 
-echo "django_instrumentation_test (CtrlB Django guide)"
+echo "django_instrumentation_test (CtrlB Django guide — logs only)"
 echo "  DJANGO_SETTINGS_MODULE=${DJANGO_SETTINGS_MODULE}"
 echo "  OTEL_SERVICE_NAME=${OTEL_SERVICE_NAME}"
-echo "  OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT}"
+echo "  OTEL_TRACES_EXPORTER=${OTEL_TRACES_EXPORTER}"
+echo "  OTEL_METRICS_EXPORTER=${OTEL_METRICS_EXPORTER}"
+echo "  OTEL_LOGS_EXPORTER=${OTEL_LOGS_EXPORTER}"
+echo "  OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=${OTEL_EXPORTER_OTLP_LOGS_ENDPOINT}"
 echo "  launcher: opentelemetry-instrument python manage.py runserver 0.0.0.0:${PORT} --noreload"
 echo
 
