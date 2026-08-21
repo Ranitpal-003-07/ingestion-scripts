@@ -1,4 +1,4 @@
-"""OTLP exporters and per-service tracers for New Relic."""
+"""OTLP exporters and per-service tracers for New Relic/CtrlB/custom backends."""
 
 from __future__ import annotations
 
@@ -24,26 +24,34 @@ if TYPE_CHECKING:
 
 
 class OtlpSession:
-    """Manages OTLP trace/metric export to New Relic for all demo services."""
+    """Manages OTLP trace/metric export for all demo services."""
 
     def __init__(self) -> None:
-        headers = {"api-key": config.LICENSE_KEY}
+        headers = config.build_otlp_headers()
         os.environ.setdefault(
             "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE", "delta"
         )
 
         self._span_exporters: list[OTLPSpanExporter] = []
-        self._metric_exporter = OTLPMetricExporter(
-            endpoint=f"{config.OTLP_ENDPOINT}/v1/metrics",
-            headers=headers,
+        traces_endpoint = (
+            config.OTLP_TRACES_ENDPOINT or f"{config.OTLP_ENDPOINT}/v1/traces"
         )
+        metrics_endpoint = (
+            config.OTLP_METRICS_ENDPOINT or f"{config.OTLP_ENDPOINT}/v1/metrics"
+        )
+        self._metric_exporter: OTLPMetricExporter | None = None
+        if not config.OTLP_DISABLE_METRICS:
+            self._metric_exporter = OTLPMetricExporter(
+                endpoint=metrics_endpoint,
+                headers=headers,
+            )
 
         self._tracer_providers: list[TracerProvider] = []
         self._tracers: dict[str, Tracer] = {}
 
         for service_name in config.SERVICES:
             span_exporter = OTLPSpanExporter(
-                endpoint=f"{config.OTLP_ENDPOINT}/v1/traces",
+                endpoint=traces_endpoint,
                 headers=headers,
             )
             self._span_exporters.append(span_exporter)
@@ -71,13 +79,17 @@ class OtlpSession:
                 "deployment.environment": config.DEPLOYMENT_ENV,
             }
         )
-        metric_reader = PeriodicExportingMetricReader(
-            self._metric_exporter,
-            export_interval_millis=5000,
-        )
+        metric_readers = []
+        if self._metric_exporter is not None:
+            metric_readers.append(
+                PeriodicExportingMetricReader(
+                    self._metric_exporter,
+                    export_interval_millis=5000,
+                )
+            )
         self._meter_provider = MeterProvider(
             resource=default_resource,
-            metric_readers=[metric_reader],
+            metric_readers=metric_readers,
         )
         metrics.set_meter_provider(self._meter_provider)
         self._meter = metrics.get_meter("nr-fake-apm")
@@ -168,13 +180,16 @@ class OtlpSession:
     def flush(self) -> None:
         for provider in self._tracer_providers:
             provider.force_flush()
-        self._meter_provider.force_flush()
+        if self._metric_exporter is not None:
+            self._meter_provider.force_flush()
 
     def shutdown(self) -> None:
         self.flush()
         for provider in self._tracer_providers:
             provider.shutdown()
-        self._meter_provider.shutdown()
+        if self._metric_exporter is not None:
+            self._meter_provider.shutdown()
         for exporter in self._span_exporters:
             exporter.shutdown()
-        self._metric_exporter.shutdown()
+        if self._metric_exporter is not None:
+            self._metric_exporter.shutdown()

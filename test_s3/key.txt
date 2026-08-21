@@ -1,0 +1,4 @@
+# Non-secret config only. Credentials come from the default IAM chain
+# (instance role, ~/.aws/credentials, or aws sso login) — no access keys needed.
+export AWS_REGION=ap-south-1
+export S3_BUCKET=ctrlb-5tb-benchmark-logs-public

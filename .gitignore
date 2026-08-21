@@ -3,7 +3,6 @@ __pycache__/
 *.pyc
 .env
 temp.json
-test_s3
-s3_copy
-sqs-poll
+*-sa.json
+gcp-sa.json
 iam

@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-Ingest synthetic OpenTelemetry traces and metrics into New Relic (US OTLP).
+Ingest synthetic OpenTelemetry traces and metrics to OTLP backends
+(New Relic by default, CtrlB/custom via env).
 
 Environment:
-  NEW_RELIC_LICENSE_KEY   Required ingest license key
+  NEW_RELIC_LICENSE_KEY   New Relic ingest key (default auth source)
+  OTLP_AUTH_TOKEN         Optional auth token for CtrlB/custom OTLP backends
+  OTLP_AUTH_HEADER        Auth header name (default: api-key)
   TRACES_PER_SECOND       Traces per second (default: 5, max: 100)
   DEPLOYMENT_ENV          deployment.environment resource attr (default: demo)
   OTEL_EXPORTER_OTLP_ENDPOINT  Default: https://otlp.nr-data.net
@@ -35,9 +38,15 @@ from __future__ import annotations
 
 import argparse
 import logging
+from pathlib import Path
 import signal
 import sys
 import time
+
+# Allow running as: python random/ingest_traces.py
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from nr_traces import config, scenarios
 from nr_traces.otlp import OtlpSession
@@ -61,7 +70,8 @@ def run_once(session: OtlpSession) -> None:
 
 def run_loop(session: OtlpSession) -> None:
     logger.info(
-        "Starting New Relic trace ingestion (%s traces/sec, env=%s)",
+        "Starting OTLP trace ingestion to %s (%s traces/sec, env=%s)",
+        config.OTLP_ENDPOINT,
         config.TRACES_PER_SECOND,
         config.DEPLOYMENT_ENV,
     )
@@ -101,7 +111,7 @@ def run_loop(session: OtlpSession) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Ingest synthetic APM traces into New Relic via OTLP"
+        description="Ingest synthetic APM traces into OTLP backend (New Relic/CtrlB/custom)"
     )
     parser.add_argument(
         "--once",

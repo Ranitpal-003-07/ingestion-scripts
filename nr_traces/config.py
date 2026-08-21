@@ -4,6 +4,7 @@ import logging
 import os
 import uuid
 
+
 def _clean_env(value: str) -> str:
     """Strip whitespace/newlines often introduced when copying keys from files."""
     return value.strip().strip('"').strip("'")
@@ -12,8 +13,26 @@ def _clean_env(value: str) -> str:
 OTLP_ENDPOINT = _clean_env(
     os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "https://otlp.nr-data.net")
 ).rstrip("/")
+OTLP_TRACES_ENDPOINT = _clean_env(
+    os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+    or os.environ.get("OTLP_TRACES_ENDPOINT", "")
+)
+OTLP_METRICS_ENDPOINT = _clean_env(
+    os.environ.get("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
+    or os.environ.get("OTLP_METRICS_ENDPOINT", "")
+)
+OTLP_DISABLE_METRICS = _clean_env(os.environ.get("OTLP_DISABLE_METRICS", "")).lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+) or _clean_env(os.environ.get("OTEL_METRICS_EXPORTER", "")).lower() == "none"
 _LICENSE_KEY_RAW = os.environ.get("NEW_RELIC_LICENSE_KEY", "")
 LICENSE_KEY = _clean_env(_LICENSE_KEY_RAW)
+OTLP_AUTH_HEADER = _clean_env(os.environ.get("OTLP_AUTH_HEADER", "api-key")) or "api-key"
+OTLP_AUTH_TOKEN = _clean_env(os.environ.get("OTLP_AUTH_TOKEN", LICENSE_KEY))
+STREAM_HEADER_KEY = _clean_env(os.environ.get("STREAM_HEADER_KEY", ""))
+STREAM_NAME = _clean_env(os.environ.get("STREAM_NAME", ""))
 DEPLOYMENT_ENV = _clean_env(os.environ.get("DEPLOYMENT_ENV", "demo")) or "demo"
 SERVICE_INSTANCE_ID = os.environ.get("SERVICE_INSTANCE_ID", str(uuid.uuid4()))
 
@@ -65,18 +84,45 @@ SERVICES = (
     "demo-auth-service",
 )
 
+def _parse_otlp_headers(raw: str) -> dict[str, str]:
+    """Parse OTEL_EXPORTER_OTLP_HEADERS: key=value,key2=value2."""
+    headers: dict[str, str] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if "=" in part:
+            key, value = part.split("=", 1)
+            headers[key.strip()] = value.strip()
+    return headers
+
+
+def is_new_relic_backend() -> bool:
+    endpoint = OTLP_TRACES_ENDPOINT or OTLP_ENDPOINT
+    return "nr-data.net" in endpoint
+
+
+def build_otlp_headers() -> dict[str, str]:
+    """Build OTLP HTTP headers (CtrlB: OTEL_EXPORTER_OTLP_HEADERS)."""
+    headers = _parse_otlp_headers(
+        _clean_env(os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", ""))
+    )
+    if OTLP_AUTH_TOKEN and OTLP_AUTH_HEADER not in headers:
+        headers[OTLP_AUTH_HEADER] = OTLP_AUTH_TOKEN
+    if STREAM_HEADER_KEY and STREAM_NAME:
+        headers[STREAM_HEADER_KEY] = STREAM_NAME
+    return headers
+
+
 def validate_config() -> None:
-    if not LICENSE_KEY:
+    if is_new_relic_backend() and not OTLP_AUTH_TOKEN:
         raise SystemExit(
-            "NEW_RELIC_LICENSE_KEY is required. "
-            "Export your New Relic ingest license key before running."
+            "NEW_RELIC_LICENSE_KEY is required for New Relic OTLP export."
         )
     if _LICENSE_KEY_RAW != LICENSE_KEY:
         logging.warning(
             "NEW_RELIC_LICENSE_KEY contained leading/trailing whitespace; stripped."
         )
-    if any(ch in LICENSE_KEY for ch in "\r\n\t"):
+    if OTLP_AUTH_TOKEN and any(ch in OTLP_AUTH_TOKEN for ch in "\r\n\t"):
         raise SystemExit(
-            "NEW_RELIC_LICENSE_KEY contains invalid characters (newline/tab). "
-            "Re-export on one line: export NEW_RELIC_LICENSE_KEY='NRAK-...'"
+            "OTLP auth token contains invalid characters (newline/tab). "
+            "Re-export on one line."
         )

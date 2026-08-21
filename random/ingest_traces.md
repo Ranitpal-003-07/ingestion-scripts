@@ -2,7 +2,7 @@
 
 ## Overview
 
-Ingests **synthetic OpenTelemetry traces and metrics** into New Relic via OTLP/HTTP. The [`nr_traces`](nr_traces/) package emits weighted random APM scenarios (checkout, errors, database calls, etc.) across six `demo-*` services. Supports continuous load or a single-trace smoke test.
+Ingests **synthetic OpenTelemetry traces and metrics** via OTLP/HTTP. Defaults to New Relic, but can target CtrlB/custom OTLP collectors by changing endpoint/auth env vars. The [`nr_traces`](nr_traces/) package emits weighted random APM scenarios (checkout, errors, database calls, etc.) across six `demo-*` services. Supports continuous load or a single-trace smoke test.
 
 ## Endpoint
 
@@ -23,11 +23,11 @@ Example resolved URLs with defaults:
 
 ## Authentication / headers
 
-OTLP exporters send:
+OTLP exporters send one auth header:
 
 | Header | Value |
 |--------|-------|
-| `api-key` | `NEW_RELIC_LICENSE_KEY` (ingest license key) |
+| `OTLP_AUTH_HEADER` (default `api-key`) | `OTLP_AUTH_TOKEN` (or fallback `NEW_RELIC_LICENSE_KEY`) |
 
 Validated at startup via [`nr_traces/config.py`](nr_traces/config.py) `validate_config()`.
 
@@ -37,7 +37,9 @@ Validated at startup via [`nr_traces/config.py`](nr_traces/config.py) `validate_
 
 | Variable | Required | Default | Purpose |
 |----------|----------|---------|---------|
-| `NEW_RELIC_LICENSE_KEY` | **Yes** | — | Ingest license key |
+| `NEW_RELIC_LICENSE_KEY` | Conditional | — | New Relic ingest key (fallback auth token) |
+| `OTLP_AUTH_TOKEN` | Conditional | `NEW_RELIC_LICENSE_KEY` | Auth token for CtrlB/custom OTLP |
+| `OTLP_AUTH_HEADER` | No | `api-key` | Auth header name for OTLP requests |
 | `TRACES_PER_SECOND` | No | `5` | Traces emitted per loop iteration (max **100**) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | `https://otlp.nr-data.net` | OTLP base URL (no trailing path) |
 | `DEPLOYMENT_ENV` | No | `demo` | `deployment.environment` resource attribute |
@@ -67,6 +69,15 @@ export DEPLOYMENT_ENV=demo
 export OTEL_EXPORTER_OTLP_ENDPOINT="https://otlp.nr-data.net"
 ```
 
+### CtrlB OTLP example
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT="https://<ctrlb-otlp-host>"
+export OTLP_AUTH_HEADER="Authorization"
+export OTLP_AUTH_TOKEN="Bearer <token>"
+export TRACES_PER_SECOND=5
+```
+
 ## Setup
 
 1. **Python:** 3.10+ recommended.
@@ -83,7 +94,7 @@ export OTEL_EXPORTER_OTLP_ENDPOINT="https://otlp.nr-data.net"
 
 ## How to run
 
-1. Complete Setup and export `NEW_RELIC_LICENSE_KEY`.
+1. Complete Setup and export auth envs (`NEW_RELIC_LICENSE_KEY` or `OTLP_AUTH_TOKEN`).
 2. **Smoke test** (one trace, flush, exit):
    ```bash
    python ingest_traces.py --once
