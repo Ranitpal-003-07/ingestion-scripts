@@ -45,11 +45,12 @@ func main() {
 	}()
 
 	sourceRegion := envOr("S3_SOURCE_REGION", envOr("AWS_REGION", defaultRegion))
-	destRegion := envOr("S3_DEST_REGION", envOr("AWS_REGION", sourceRegion))
+	defaultDestRegion := envOr("S3_DEST_REGION", envOr("AWS_REGION", sourceRegion))
 	sourceBucket := os.Getenv("S3_SOURCE_BUCKET")
-	destBucket := os.Getenv("S3_DEST_BUCKET")
+	destBuckets := parseCSV(envOr("S3_DEST_BUCKETS", os.Getenv("S3_DEST_BUCKET")))
+	destRegions := parseCSV(os.Getenv("S3_DEST_REGIONS"))
 	prefix := os.Getenv("S3_PREFIX")
-	destPrefix := os.Getenv("S3_DEST_PREFIX")
+	destPrefixes := parseCSV(envOr("S3_DEST_PREFIXES", os.Getenv("S3_DEST_PREFIX")))
 	workers := envInt("S3_COPY_WORKERS", 10)
 	batchSize := envInt("S3_BATCH_SIZE", 10)
 	batchInterval := envDuration("S3_BATCH_INTERVAL", 0)
@@ -64,8 +65,16 @@ func main() {
 	if sourceBucket == "" {
 		log.Fatal("S3_SOURCE_BUCKET is required (set in .env or env)")
 	}
-	if destBucket == "" {
-		log.Fatal("S3_DEST_BUCKET is required (set in .env or env)")
+	if len(destBuckets) == 0 {
+		log.Fatal("S3_DEST_BUCKET or S3_DEST_BUCKETS is required (set in .env or env)")
+	}
+	if len(destRegions) > 0 && len(destRegions) != len(destBuckets) {
+		log.Fatalf("S3_DEST_REGIONS has %d entries but S3_DEST_BUCKET(S) has %d — counts must match (or omit S3_DEST_REGIONS to use S3_DEST_REGION for all)",
+			len(destRegions), len(destBuckets))
+	}
+	if len(destPrefixes) > 1 && len(destPrefixes) != len(destBuckets) {
+		log.Fatalf("S3_DEST_PREFIX(ES) has %d entries but S3_DEST_BUCKET(S) has %d — use one shared prefix or one per bucket",
+			len(destPrefixes), len(destBuckets))
 	}
 
 	sourceClient, err := newS3Client(ctx, sourceRegion)
@@ -73,13 +82,39 @@ func main() {
 		log.Fatalf("load AWS config (source region %s): %v", sourceRegion, err)
 	}
 
-	destClient, err := newS3Client(ctx, destRegion)
-	if err != nil {
-		log.Fatalf("load AWS config (dest region %s): %v", destRegion, err)
+	dests := make([]destTarget, 0, len(destBuckets))
+	clientByRegion := map[string]*s3.Client{}
+	for i, bucket := range destBuckets {
+		region := defaultDestRegion
+		if len(destRegions) > 0 {
+			region = destRegions[i]
+		}
+		prefixForDest := ""
+		switch {
+		case len(destPrefixes) == 1:
+			prefixForDest = destPrefixes[0]
+		case len(destPrefixes) > 1:
+			prefixForDest = destPrefixes[i]
+		}
+		client, ok := clientByRegion[region]
+		if !ok {
+			client, err = newS3Client(ctx, region)
+			if err != nil {
+				log.Fatalf("load AWS config (dest region %s): %v", region, err)
+			}
+			clientByRegion[region] = client
+		}
+		dests = append(dests, destTarget{
+			bucket: bucket,
+			region: region,
+			prefix: prefixForDest,
+			client: client,
+		})
 	}
 
-	log.Printf("copy s3://%s (%s) -> s3://%s (%s) (prefix=%q, dest_prefix=%q, workers=%d, batch_size=%d, batch_interval=%s)",
-		sourceBucket, sourceRegion, destBucket, destRegion, prefix, destPrefix, workers, batchSize, batchInterval)
+	destSummary := formatDests(dests)
+	log.Printf("copy s3://%s (%s) -> %s (prefix=%q, workers=%d, batch_size=%d, batch_interval=%s)",
+		sourceBucket, sourceRegion, destSummary, prefix, workers, batchSize, batchInterval)
 
 	listStart := time.Now()
 	keys, err := listKeysWithRetry(ctx, sourceClient, sourceBucket, prefix, retryDelay)
@@ -92,10 +127,11 @@ func main() {
 	fmt.Println("\n--- list ---")
 	fmt.Printf("source:        s3://%s\n", sourceBucket)
 	fmt.Printf("source_region: %s\n", sourceRegion)
-	fmt.Printf("dest:          s3://%s\n", destBucket)
-	fmt.Printf("dest_region:   %s\n", destRegion)
+	fmt.Printf("dests:         %d\n", len(dests))
+	for i, d := range dests {
+		fmt.Printf("  dest[%d]:     s3://%s (%s) dest_prefix=%q\n", i, d.bucket, d.region, d.prefix)
+	}
 	fmt.Printf("prefix:        %q\n", prefix)
-	fmt.Printf("dest_prefix:   %q\n", destPrefix)
 	fmt.Printf("workers:       %d\n", workers)
 	fmt.Printf("batch_size:    %d\n", batchSize)
 	fmt.Printf("batch_interval:%s\n", batchInterval)
@@ -114,11 +150,11 @@ func main() {
 	batches := chunkKeys(keys, batchSize)
 	for i, batch := range batches {
 		batchNum := i + 1
-		log.Printf("BATCH START batch=%d/%d files=%d", batchNum, len(batches), len(batch))
+		log.Printf("BATCH START batch=%d/%d files=%d dests=%d", batchNum, len(batches), len(batch), len(dests))
 
 		batchStart := time.Now()
-		copied, failed, bytes := runBatch(ctx, sourceClient, destClient, workers,
-			sourceBucket, destBucket, destPrefix, batch, retryDelay)
+		copied, failed, bytes := runBatch(ctx, sourceClient, dests, workers,
+			sourceBucket, batch, retryDelay)
 
 		batchElapsed := time.Since(batchStart)
 		totalCopied.Add(copied)
@@ -144,9 +180,12 @@ func main() {
 
 	copyElapsed := time.Since(copyStart)
 	overallRate := filesPerSec(totalCopied.Load(), copyElapsed)
+	expectedPuts := int64(len(keys) * len(dests))
 
 	fmt.Println("\n--- copy summary ---")
-	fmt.Printf("total:       %d\n", len(keys))
+	fmt.Printf("objects:     %d\n", len(keys))
+	fmt.Printf("dests:       %d\n", len(dests))
+	fmt.Printf("puts:        %d\n", expectedPuts)
 	fmt.Printf("batches:     %d\n", len(batches))
 	fmt.Printf("copied:      %d\n", totalCopied.Load())
 	fmt.Printf("failed:      %d\n", totalFailed.Load())
@@ -154,9 +193,16 @@ func main() {
 	fmt.Printf("elapsed:     %s\n", copyElapsed)
 	fmt.Printf("rate:        %.2f files/s\n", overallRate)
 
-	log.Printf("COPY SUMMARY total=%d copied=%d failed=%d bytes=%d batches=%d elapsed=%s rate=%.2f files/s",
-		len(keys), totalCopied.Load(), totalFailed.Load(), totalBytes.Load(),
+	log.Printf("COPY SUMMARY objects=%d dests=%d puts=%d copied=%d failed=%d bytes=%d batches=%d elapsed=%s rate=%.2f files/s",
+		len(keys), len(dests), expectedPuts, totalCopied.Load(), totalFailed.Load(), totalBytes.Load(),
 		len(batches), copyElapsed, overallRate)
+}
+
+type destTarget struct {
+	bucket string
+	region string
+	prefix string
+	client *s3.Client
 }
 
 type batchStats struct {
@@ -165,8 +211,8 @@ type batchStats struct {
 	bytes  int64
 }
 
-func runBatch(ctx context.Context, sourceClient, destClient *s3.Client, workers int,
-	sourceBucket, destBucket, destPrefix string, keys []string, retryDelay time.Duration) (copied, failed, bytes int64) {
+func runBatch(ctx context.Context, sourceClient *s3.Client, dests []destTarget, workers int,
+	sourceBucket string, keys []string, retryDelay time.Duration) (copied, failed, bytes int64) {
 
 	jobs := make(chan string, len(keys))
 	var stats batchStats
@@ -177,17 +223,19 @@ func runBatch(ctx context.Context, sourceClient, destClient *s3.Client, workers 
 		go func() {
 			defer wg.Done()
 			for key := range jobs {
-				destKey := destPrefix + key
-				n, err := copyObjectUntilSuccess(ctx, sourceClient, destClient,
-					sourceBucket, destBucket, key, destKey, retryDelay)
-				if err != nil {
-					atomic.AddInt64(&stats.failed, 1)
-					log.Printf("COPY STOP s3://%s/%s -> s3://%s/%s | %v",
-						sourceBucket, key, destBucket, destKey, err)
-					continue
+				for _, dest := range dests {
+					destKey := dest.prefix + key
+					n, err := copyObjectUntilSuccess(ctx, sourceClient, dest.client,
+						sourceBucket, dest.bucket, key, destKey, retryDelay)
+					if err != nil {
+						atomic.AddInt64(&stats.failed, 1)
+						log.Printf("COPY STOP s3://%s/%s -> s3://%s/%s | %v",
+							sourceBucket, key, dest.bucket, destKey, err)
+						continue
+					}
+					atomic.AddInt64(&stats.copied, 1)
+					atomic.AddInt64(&stats.bytes, n)
 				}
-				atomic.AddInt64(&stats.copied, 1)
-				atomic.AddInt64(&stats.bytes, n)
 			}
 		}()
 	}
@@ -230,6 +278,29 @@ func copyObjectUntilSuccess(ctx context.Context, sourceClient, destClient *s3.Cl
 			return 0, ctx.Err()
 		}
 	}
+}
+
+func parseCSV(v string) []string {
+	if strings.TrimSpace(v) == "" {
+		return nil
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func formatDests(dests []destTarget) string {
+	parts := make([]string, 0, len(dests))
+	for _, d := range dests {
+		parts = append(parts, fmt.Sprintf("s3://%s (%s)", d.bucket, d.region))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func listKeysWithRetry(ctx context.Context, client *s3.Client, bucket, prefix string, retryDelay time.Duration) ([]string, error) {
