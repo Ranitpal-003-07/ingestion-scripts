@@ -1,3 +1,0 @@
-# Zero-code path (docs Step 1A): distro + bootstrap installs matching instrumentors.
-opentelemetry-distro
-opentelemetry-exporter-otlp
