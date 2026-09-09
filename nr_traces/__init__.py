@@ -1,1 +1,1 @@
-"""Synthetic OpenTelemetry traces and metrics for New Relic APM."""
+"""Synthetic OpenTelemetry traces for New Relic / CtrlB APM testing."""

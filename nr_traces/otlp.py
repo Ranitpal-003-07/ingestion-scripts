@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import TYPE_CHECKING
 
@@ -19,8 +20,25 @@ from nr_traces import config
 
 if TYPE_CHECKING:
     from opentelemetry.context import Context
-    from opentelemetry.metrics import Meter
     from opentelemetry.trace import Tracer
+
+logger = logging.getLogger(__name__)
+
+
+class _SharedSpanExporter:
+    """Wraps one exporter so multiple BatchSpanProcessors don't shut it down."""
+
+    def __init__(self, exporter: OTLPSpanExporter) -> None:
+        self._exporter = exporter
+
+    def export(self, spans):  # noqa: ANN001
+        return self._exporter.export(spans)
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:
+        return self._exporter.force_flush(timeout_millis=timeout_millis)
+
+    def shutdown(self) -> None:
+        return None
 
 
 class OtlpSession:
@@ -32,13 +50,23 @@ class OtlpSession:
             "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE", "delta"
         )
 
-        self._span_exporters: list[OTLPSpanExporter] = []
-        traces_endpoint = (
-            config.OTLP_TRACES_ENDPOINT or f"{config.OTLP_ENDPOINT}/v1/traces"
+        traces_endpoint = config.resolve_traces_endpoint()
+        metrics_endpoint = config.resolve_metrics_endpoint()
+        logger.info(
+            "OTLP traces endpoint=%s headers=%s",
+            traces_endpoint,
+            {
+                k: ("***" if k.lower() in ("authorization", "api-key") else v)
+                for k, v in headers.items()
+            },
         )
-        metrics_endpoint = (
-            config.OTLP_METRICS_ENDPOINT or f"{config.OTLP_ENDPOINT}/v1/metrics"
+
+        # One shared exporter — 6 parallel exporters caused CtrlB 502s under load.
+        self._span_exporter = OTLPSpanExporter(
+            endpoint=traces_endpoint,
+            headers=headers,
         )
+        shared = _SharedSpanExporter(self._span_exporter)
         self._metric_exporter: OTLPMetricExporter | None = None
         if not config.OTLP_DISABLE_METRICS:
             self._metric_exporter = OTLPMetricExporter(
@@ -46,15 +74,18 @@ class OtlpSession:
                 headers=headers,
             )
 
+        # Gentler flush for CtrlB gateways; NR can tolerate tighter batches.
+        if config.is_ctrlb_backend():
+            schedule_delay_millis = 2000
+            max_export_batch_size = 64
+        else:
+            schedule_delay_millis = 500
+            max_export_batch_size = 512
+
         self._tracer_providers: list[TracerProvider] = []
         self._tracers: dict[str, Tracer] = {}
 
         for service_name in config.SERVICES:
-            span_exporter = OTLPSpanExporter(
-                endpoint=traces_endpoint,
-                headers=headers,
-            )
-            self._span_exporters.append(span_exporter)
             resource = Resource.create(
                 {
                     "service.name": service_name,
@@ -65,8 +96,9 @@ class OtlpSession:
             provider = TracerProvider(resource=resource)
             provider.add_span_processor(
                 BatchSpanProcessor(
-                    span_exporter,
-                    schedule_delay_millis=500,
+                    shared,
+                    schedule_delay_millis=schedule_delay_millis,
+                    max_export_batch_size=max_export_batch_size,
                 )
             )
             self._tracer_providers.append(provider)
@@ -189,7 +221,6 @@ class OtlpSession:
             provider.shutdown()
         if self._metric_exporter is not None:
             self._meter_provider.shutdown()
-        for exporter in self._span_exporters:
-            exporter.shutdown()
+        self._span_exporter.shutdown()
         if self._metric_exporter is not None:
             self._metric_exporter.shutdown()

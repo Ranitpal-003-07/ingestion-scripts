@@ -2,172 +2,86 @@
 
 ## Overview
 
-Ingests **synthetic OpenTelemetry traces and metrics** via OTLP/HTTP. Defaults to New Relic, but can target CtrlB/custom OTLP collectors by changing endpoint/auth env vars. The [`nr_traces`](nr_traces/) package emits weighted random APM scenarios (checkout, errors, database calls, etc.) across six `demo-*` services. Supports continuous load or a single-trace smoke test.
+Ingests **synthetic OpenTelemetry traces** via OTLP/HTTP for APM query testing.
+Defaults to New Relic; targets **CtrlB** with `STREAM_NAME` (no auth required).
+
+Spans are shaped for the CtrlB prod schema (underscore columns): dual HTTP/DB
+semconv attrs (`http_response_status_code` + `http_status_code`,
+`db_system_name` + `db_system`, `db_sql_table` / `db_mongodb_collection` /
+`db_namespace`), NR-default errors (5xx + exceptions, separate 4xx scenario),
+and SERVER/CLIENT kinds for transaction vs DB queries.
 
 ## Endpoint
 
-Base URL from `OTEL_EXPORTER_OTLP_ENDPOINT` (default US OTLP). Exporters append standard paths in [`nr_traces/otlp.py`](nr_traces/otlp.py):
+| Backend | Traces URL |
+|---------|------------|
+| New Relic | `{OTEL_EXPORTER_OTLP_ENDPOINT}/v1/traces` (default `https://otlp.nr-data.net`) |
+| CtrlB | `{base}/v1/traces` + `stream-name: {STREAM_NAME}` header |
 
-| Property | Value |
-|----------|-------|
-| **Traces URL** | `{OTEL_EXPORTER_OTLP_ENDPOINT}/v1/traces` |
-| **Metrics URL** | `{OTEL_EXPORTER_OTLP_ENDPOINT}/v1/metrics` |
-| **Default base** | `https://otlp.nr-data.net` |
-| **Method** | `POST` (OTLP/protobuf over HTTP) |
-| **Payload** | OpenTelemetry trace spans and metrics (batched by SDK exporters) |
+Do **not** use the logs-style `/{stream}/_otel/v1/traces` path for spans — that 404s.
 
-Example resolved URLs with defaults:
-
-- `https://otlp.nr-data.net/v1/traces`
-- `https://otlp.nr-data.net/v1/metrics`
-
-## Authentication / headers
-
-OTLP exporters send one auth header:
-
-| Header | Value |
-|--------|-------|
-| `OTLP_AUTH_HEADER` (default `api-key`) | `OTLP_AUTH_TOKEN` (or fallback `NEW_RELIC_LICENSE_KEY`) |
-
-Validated at startup via [`nr_traces/config.py`](nr_traces/config.py) `validate_config()`.
-
-## Configuration
-
-### Environment variables
-
-| Variable | Required | Default | Purpose |
-|----------|----------|---------|---------|
-| `NEW_RELIC_LICENSE_KEY` | Conditional | — | New Relic ingest key (fallback auth token) |
-| `OTLP_AUTH_TOKEN` | Conditional | `NEW_RELIC_LICENSE_KEY` | Auth token for CtrlB/custom OTLP |
-| `OTLP_AUTH_HEADER` | No | `api-key` | Auth header name for OTLP requests |
-| `TRACES_PER_SECOND` | No | `5` | Traces emitted per loop iteration (max **100**) |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | No | `https://otlp.nr-data.net` | OTLP base URL (no trailing path) |
-| `DEPLOYMENT_ENV` | No | `demo` | `deployment.environment` resource attribute |
-| `SERVICE_INSTANCE_ID` | No | Random UUID | `service.instance.id` on all demo services |
-
-**Rate resolution order:** `--rate` CLI flag → `TRACES_PER_SECOND` env → default `5`. Values above 100 are capped with a warning.
-
-### Demo services (resource `service.name`)
-
-Defined in [`nr_traces/config.py`](nr_traces/config.py):
-
-- `demo-api-gateway`
-- `demo-orders-service`
-- `demo-inventory-service`
-- `demo-payment-service`
-- `demo-notification-worker`
-- `demo-auth-service`
-
-Scenarios are implemented in [`nr_traces/scenarios.py`](nr_traces/scenarios.py).
-
-### Example
+## CtrlB example
 
 ```bash
-export NEW_RELIC_LICENSE_KEY="NRAK-xxxxxxxx"
-export TRACES_PER_SECOND=10
-export DEPLOYMENT_ENV=demo
-export OTEL_EXPORTER_OTLP_ENDPOINT="https://otlp.nr-data.net"
+cd random
+cp .env.traces.example .env   # set STREAM_NAME
+set -a && source .env && set +a
+pip install -r requirements.txt
+python ingest_traces.py --once
+python ingest_traces.py --rate 5
 ```
-
-### CtrlB OTLP example
 
 ```bash
-export OTEL_EXPORTER_OTLP_ENDPOINT="https://<ctrlb-otlp-host>"
-export OTLP_AUTH_HEADER="Authorization"
-export OTLP_AUTH_TOKEN="Bearer <token>"
-export TRACES_PER_SECOND=5
+export OTEL_EXPORTER_OTLP_ENDPOINT="https://staging.ctrlb.dev/engine/api/default"
+export STREAM_NAME="your_traces_stream"
+python ingest_traces.py --rate 5
 ```
 
-## Setup
+Metrics are **disabled by default** on CtrlB (`OTLP_DISABLE_METRICS`).
 
-1. **Python:** 3.10+ recommended.
-2. **Virtualenv (optional):**
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   ```
-3. **Dependencies** from repo root:
-   ```bash
-   pip install -r requirements.txt
-   ```
-   Includes OpenTelemetry API/SDK and `opentelemetry-exporter-otlp-proto-http` (see [`requirements.txt`](requirements.txt)).
+## What gets emitted (query coverage)
 
-## How to run
+| Scenario | Why |
+|----------|-----|
+| `checkout_happy_path` | SERVER txn + postgres CLIENT (`db_sql_table=orders`) + HTTP client |
+| `checkout_payment_failure` | 5xx + `status_code=ERROR` + exception |
+| `checkout_client_error` | 4xx only (should **not** count as NR-default error) |
+| `auth_slow_trace` | Slow SERVER + redis CLIENT (apdex / slowest) |
+| `search_mixed_db` | mysql / mongodb / redis normalized DB keys |
+| `db_error_query` | DB error + `db_response_status_code=500` |
+| `grpc_inventory_check` | `rpc_system` / `rpc_method` / `rpc_grpc_status_code` |
+| `kafka_order_fulfilled` | messaging CONSUMER/PRODUCER |
 
-1. Complete Setup and export auth envs (`NEW_RELIC_LICENSE_KEY` or `OTLP_AUTH_TOKEN`).
-2. **Smoke test** (one trace, flush, exit):
-   ```bash
-   python ingest_traces.py --once
-   ```
-3. **Continuous ingestion** (default 5 traces/sec):
-   ```bash
-   python ingest_traces.py
-   ```
-4. **Override rate:**
-   ```bash
-   python ingest_traces.py --rate 10
-   ```
-5. **Verbose:**
-   ```bash
-   python ingest_traces.py -v
-   ```
-6. Stop with **Ctrl+C** or **SIGTERM** — exporters flush on shutdown.
+Demo `service.name` values: `demo-api-gateway`, `demo-orders-service`,
+`demo-inventory-service`, `demo-payment-service`, `demo-notification-worker`,
+`demo-auth-service`.
 
-Progress logs every 10 seconds in continuous mode.
-
-## CLI flags
-
-| Flag | Description |
-|------|-------------|
-| `--once` | Emit a single random trace, flush, and exit |
-| `--rate N` | Traces per second; overrides `TRACES_PER_SECOND` env (default 5, max 100) |
-| `-v`, `--verbose` | Enable debug logging (includes `trace.id` per emit) |
-
-```bash
-python ingest_traces.py --help
-```
-
-## Verification
-
-Allow **2–5 minutes** before querying New Relic.
-
-**NRQL examples** (from [`ingest_traces.py`](ingest_traces.py) docstring):
+## CtrlB verification SQL
 
 ```sql
-SELECT count(*) FROM Span
-WHERE service.name LIKE 'demo-%' SINCE 30 minutes ago
+SELECT span_kind, COUNT(*) FROM "<stream>" GROUP BY span_kind ORDER BY 2 DESC;
+SELECT span_status, COUNT(*) FROM "<stream>" GROUP BY span_status;
+
+SELECT service_name, operation_name, COUNT(*) FROM "<stream>"
+WHERE service_name LIKE 'demo-%'
+  AND (span_kind = '2' OR span_kind = 'SPAN_KIND_SERVER')
+GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 20;
+
+SELECT COALESCE(NULLIF(db_system_name,''), db_system) AS sys,
+       COALESCE(NULLIF(db_operation_name,''), db_operation) AS op,
+       COALESCE(NULLIF(db_sql_table,''), NULLIF(db_mongodb_collection,''),
+                NULLIF(db_namespace,''), db_name) AS target,
+       COUNT(*) FROM "<stream>"
+WHERE (span_kind = '3' OR span_kind = 'SPAN_KIND_CLIENT')
+  AND COALESCE(NULLIF(db_system_name,''), db_system, '') != ''
+GROUP BY 1, 2, 3 ORDER BY 4 DESC LIMIT 20;
 ```
 
-```sql
-SELECT count(*) FROM Span
-WHERE service.name = 'demo-api-gateway' AND transaction.name IS NOT NULL
-SINCE 30 minutes ago
-```
-
-```sql
-SELECT count(*) FROM Span WHERE error.message IS NOT NULL SINCE 30 minutes ago
-```
-
-```sql
-SELECT count(*) FROM Span WHERE db.system IS NOT NULL SINCE 30 minutes ago
-```
-
-**UI:** APM & Services → filter **demo-*** OpenTelemetry services → Transactions, Databases, External services, Distributed tracing, Service map.
-
-**Stdout:** `--once` logs `Emitted trace trace.id=...`; continuous mode logs interval counts and errors.
-
-## Related scripts
-
-- [`ingest_nr_logs.md`](ingest_nr_logs.md) — WAF logs to New Relic Log API (same license key validation).
-- [`ingest_logs.md`](ingest_logs.md) — CtrlB WAF log ingestion (no New Relic).
-
-### `nr_traces` package
-
-Not run directly; used by `ingest_traces.py`:
+## Package layout
 
 | Module | Role |
 |--------|------|
-| [`nr_traces/config.py`](nr_traces/config.py) | Env vars, license key validation, service list |
-| [`nr_traces/otlp.py`](nr_traces/otlp.py) | `OtlpSession` — OTLP trace/metric exporters |
-| [`nr_traces/scenarios.py`](nr_traces/scenarios.py) | Synthetic trace scenarios |
-| [`nr_traces/ids.py`](nr_traces/ids.py) | Trace/customer/order ID helpers |
+| [`nr_traces/attrs.py`](../nr_traces/attrs.py) | Schema-aligned attribute builders |
+| [`nr_traces/scenarios.py`](../nr_traces/scenarios.py) | Weighted APM scenarios |
+| [`nr_traces/config.py`](../nr_traces/config.py) | Endpoint / stream / auth |
+| [`nr_traces/otlp.py`](../nr_traces/otlp.py) | OTLP session |

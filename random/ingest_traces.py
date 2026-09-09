@@ -1,37 +1,41 @@
 #!/usr/bin/env python3
 """
-Ingest synthetic OpenTelemetry traces and metrics to OTLP backends
-(New Relic by default, CtrlB/custom via env).
+Ingest synthetic OpenTelemetry traces (and optional metrics) to OTLP backends.
+Defaults to New Relic; target CtrlB via endpoint + STREAM_NAME / headers.
 
 Environment:
-  NEW_RELIC_LICENSE_KEY   New Relic ingest key (default auth source)
-  OTLP_AUTH_TOKEN         Optional auth token for CtrlB/custom OTLP backends
-  OTLP_AUTH_HEADER        Auth header name (default: api-key)
+  NEW_RELIC_LICENSE_KEY   New Relic ingest key (required only for NR)
+  STREAM_NAME             CtrlB stream (sent as stream-name header)
+  OTEL_EXPORTER_OTLP_ENDPOINT  NR default or CtrlB base (.../engine/api/default)
+  OTEL_EXPORTER_OTLP_HEADERS   Optional extra headers
   TRACES_PER_SECOND       Traces per second (default: 5, max: 100)
-  DEPLOYMENT_ENV          deployment.environment resource attr (default: demo)
-  OTEL_EXPORTER_OTLP_ENDPOINT  Default: https://otlp.nr-data.net
+  DEPLOYMENT_ENV          deployment.environment (default: demo)
+  OTLP_DISABLE_METRICS    Default on for CtrlB; set 0 to enable metrics export
 
 Usage:
   pip install -r requirements.txt
+  # New Relic
   export NEW_RELIC_LICENSE_KEY="..."
-  python ingest_traces.py              # continuous ingestion (5 traces/sec)
-  python ingest_traces.py --rate 10    # override env/default rate
-  python ingest_traces.py --once       # emit one trace and exit
+  python ingest_traces.py --once
 
-Verification (after 2-5 minutes in New Relic):
-  SELECT count(*) FROM Span
-  WHERE service.name LIKE 'demo-%' SINCE 30 minutes ago
+  # CtrlB (no Authorization required; stream via header)
+  export OTEL_EXPORTER_OTLP_ENDPOINT="https://staging.ctrlb.dev/engine/api/default"
+  export STREAM_NAME="your_traces_stream"
+  python3 ingest_traces.py --rate 5
 
-  SELECT count(*) FROM Span
-  WHERE service.name = 'demo-api-gateway' AND transaction.name IS NOT NULL
-  SINCE 30 minutes ago
-
-  SELECT count(*) FROM Span WHERE error.message IS NOT NULL SINCE 30 minutes ago
-
-  SELECT count(*) FROM Span WHERE db.system IS NOT NULL SINCE 30 minutes ago
-
-UI: APM & Services -> filter demo-* OpenTelemetry services
-  - Transactions, Databases, External services, Distributed tracing, Service map
+CtrlB SQL smoke checks (replace <stream>):
+  SELECT span_kind, COUNT(*) FROM "<stream>" GROUP BY span_kind ORDER BY 2 DESC;
+  SELECT span_status, COUNT(*) FROM "<stream>" GROUP BY span_status;
+  SELECT service_name, operation_name, COUNT(*) FROM "<stream>"
+    WHERE span_kind = '2' OR span_kind = 'SPAN_KIND_SERVER'
+    GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 20;
+  SELECT COALESCE(NULLIF(db_system_name,''), db_system) AS sys,
+         COALESCE(NULLIF(db_operation_name,''), db_operation) AS op,
+         COALESCE(NULLIF(db_sql_table,''), NULLIF(db_mongodb_collection,''),
+                  NULLIF(db_namespace,''), db_name) AS target,
+         COUNT(*) FROM "<stream>"
+    WHERE span_kind = '3' OR span_kind = 'SPAN_KIND_CLIENT'
+    GROUP BY 1, 2, 3 ORDER BY 4 DESC LIMIT 20;
 """
 
 from __future__ import annotations
@@ -70,10 +74,11 @@ def run_once(session: OtlpSession) -> None:
 
 def run_loop(session: OtlpSession) -> None:
     logger.info(
-        "Starting OTLP trace ingestion to %s (%s traces/sec, env=%s)",
-        config.OTLP_ENDPOINT,
+        "Starting OTLP trace ingestion to %s (%s traces/sec, env=%s, stream=%s)",
+        config.resolve_traces_endpoint(),
         config.TRACES_PER_SECOND,
         config.DEPLOYMENT_ENV,
+        config.STREAM_NAME or "-",
     )
     emitted = 0
     errors = 0
