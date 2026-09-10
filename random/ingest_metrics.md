@@ -87,14 +87,16 @@ Use these in checkquery-engine-dev against your metrics stream.
 avg by (service) (demo_cpu_usage_ratio) > 0.9
 ```
 
-**Error rate:**
+**Error rate** (counters are exported as **cumulative** so `rate()` works):
 
 ```promql
 sum by (service) (rate(demo_http_errors_total[1m]))
 /
-sum by (service) (rate(demo_http_requests_total[1m]))
+clamp_min(sum by (service) (rate(demo_http_requests_total[1m])), 0.001)
 > 0.05
 ```
+
+If `rate()` is empty, confirm counters exist first: `demo_http_requests_total` and `demo_http_errors_total`. Restart ingest after any temporality change — old delta data will not work with `rate()`.
 
 **Latency p99:**
 

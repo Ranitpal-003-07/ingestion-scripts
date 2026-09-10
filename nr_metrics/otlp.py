@@ -23,8 +23,9 @@ class OtlpMetricsSession:
 
     def __init__(self) -> None:
         headers = config.build_otlp_headers()
+        # PromQL rate()/increase() need monotonic cumulative counters, not deltas.
         os.environ.setdefault(
-            "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE", "delta"
+            "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE", "cumulative"
         )
 
         metrics_endpoint = config.resolve_metrics_endpoint()
