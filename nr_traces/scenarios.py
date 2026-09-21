@@ -73,7 +73,15 @@ class Biz:
 
 def _sleep_ms(low_ms: float, high_ms: float) -> float:
     duration_s = random.uniform(low_ms, high_ms) / 1000.0
-    time.sleep(duration_s)
+    # Cap wall-clock sleep so high --rate values can be honored.
+    from nr_traces import config
+
+    if config.TRACES_PER_SECOND >= 20:
+        time.sleep(min(duration_s, 0.002))
+    elif config.TRACES_PER_SECOND >= 10:
+        time.sleep(min(duration_s, 0.008))
+    else:
+        time.sleep(duration_s)
     return duration_s
 
 
