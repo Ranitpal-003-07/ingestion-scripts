@@ -62,9 +62,11 @@ class OtlpSession:
         )
 
         # One shared exporter — 6 parallel exporters caused CtrlB 502s under load.
+        # Enriched spans are larger; give CtrlB more than the 10s default.
         self._span_exporter = OTLPSpanExporter(
             endpoint=traces_endpoint,
             headers=headers,
+            timeout=30,
         )
         shared = _SharedSpanExporter(self._span_exporter)
         self._metric_exporter: OTLPMetricExporter | None = None
@@ -86,11 +88,29 @@ class OtlpSession:
         self._tracers: dict[str, Tracer] = {}
 
         for service_name in config.SERVICES:
+            meta = config.SERVICE_META.get(service_name, {})
             resource = Resource.create(
                 {
                     "service.name": service_name,
-                    "service.instance.id": config.SERVICE_INSTANCE_ID,
+                    "service.version": str(meta.get("version", "1.0.0")),
+                    "service.instance.id": f"{service_name}-{config.SERVICE_INSTANCE_ID[:8]}",
                     "deployment.environment": config.DEPLOYMENT_ENV,
+                    "host.name": str(meta.get("host.name", f"{service_name}-1")),
+                    "host.arch": "amd64",
+                    "os.type": "linux",
+                    "os.description": "Ubuntu 22.04.4 LTS",
+                    "os.version": "5.15.0-105-generic",
+                    "process.pid": int(meta.get("process.pid", 15000)),
+                    "process.runtime.name": "cpython",
+                    "process.runtime.version": "3.10.12",
+                    "process.runtime.description": "CPython 3.10.12",
+                    "process.command_line": f"gunicorn {service_name}.wsgi:app",
+                    "process.executable.path": "/usr/local/bin/python3.10",
+                    "container.id": str(meta.get("container.id", service_name)),
+                    "cloud.region": "us-east-1",
+                    "telemetry.distro.name": "opentelemetry",
+                    "telemetry.distro.version": "1.27.0",
+                    "telemetry.auto.version": "0.48b0",
                 }
             )
             provider = TracerProvider(resource=resource)

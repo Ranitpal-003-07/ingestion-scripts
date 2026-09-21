@@ -101,6 +101,52 @@ SERVICES = (
     "demo-auth-service",
 )
 
+# Resource attributes flatten under service_* in CtrlB (host.name → service_host_name).
+SERVICE_META: dict[str, dict[str, str | int]] = {
+    "demo-api-gateway": {
+        "version": "2.8.1",
+        "host.name": "ip-10-2-11-14",
+        "container.id": "gw-7c9d4f2a1b",
+        "process.pid": 18421,
+        "code.namespace": "gateway.http.checkout",
+    },
+    "demo-orders-service": {
+        "version": "1.19.4",
+        "host.name": "ip-10-2-24-71",
+        "container.id": "ord-3ae19c80d2",
+        "process.pid": 22104,
+        "code.namespace": "orders.api",
+    },
+    "demo-inventory-service": {
+        "version": "1.6.0",
+        "host.name": "ip-10-2-31-8",
+        "container.id": "inv-91bb0e44c7",
+        "process.pid": 19002,
+        "code.namespace": "inventory.grpc",
+    },
+    "demo-payment-service": {
+        "version": "3.2.7",
+        "host.name": "ip-10-2-18-55",
+        "container.id": "pay-55e1aa0193",
+        "process.pid": 17650,
+        "code.namespace": "payments.stripe",
+    },
+    "demo-notification-worker": {
+        "version": "0.14.2",
+        "host.name": "ip-10-2-41-12",
+        "container.id": "ntf-c01d8aa4e6",
+        "process.pid": 24011,
+        "code.namespace": "notify.worker",
+    },
+    "demo-auth-service": {
+        "version": "4.1.0",
+        "host.name": "ip-10-2-9-33",
+        "container.id": "auth-bb2188f091",
+        "process.pid": 15808,
+        "code.namespace": "auth.verify",
+    },
+}
+
 def _parse_otlp_headers(raw: str) -> dict[str, str]:
     """Parse OTEL_EXPORTER_OTLP_HEADERS: key=value,key2=value2."""
     headers: dict[str, str] = {}
