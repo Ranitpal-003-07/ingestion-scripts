@@ -1,20 +1,44 @@
-"""Synthetic trace scenarios aligned to CtrlB APM query schema.
+"""Synthetic APM scenarios for Transactions / Database / External tabs.
 
-Emits SERVER/CLIENT spans with attributes that flatten to prod columns
-(db_system_name, http_response_status_code, rpc_grpc_status_code, …)
-so transaction + NR-style DB grouping queries return non-empty results.
+Designed for CtrlB staging coverage:
+  - >500 peers / txns / DB ops / instance IDs (see catalog.py)
+  - Dual-type peers (payments/inventory HTTP+gRPC)
+  - DB vs External split (db_system set vs empty)
+  - Peer naming edges (peer_service only, net_peer_name only, conflict, nameless)
+  - HTTP 4xx/5xx without OTel ERROR + OTel ERROR peers + healthy 200s
+  - Slow/fast peers for P99 ranks
+  - Time-spread via backdated start/end timestamps
+  - Empty-external service (SERVER only)
 """
 
 from __future__ import annotations
 
 import random
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
+from opentelemetry import context as otel_context
+from opentelemetry import trace
 from opentelemetry.trace import SpanKind, Status, StatusCode
 
-from nr_traces import attrs, ids
+from nr_traces import attrs, catalog, config, ids
+from nr_traces.catalog import (
+    EMPTY_EXTERNAL_SERVICE,
+    ENTITY_TYPE_PERCENT,
+    ENTITY_TYPE_RECIPES,
+    NO_DB_SCHEMA_SERVICE,
+    PRIMARY_SERVICE,
+    DbOp,
+    PeerSpec,
+    TxnSpec,
+    pick_db_op,
+    pick_entity_type_peer,
+    pick_instance_id,
+    pick_peer,
+    pick_transaction,
+)
 from nr_traces.ids import (
     format_trace_id,
     random_amount_cents,
@@ -35,8 +59,12 @@ class Biz:
     session_id: str = field(default_factory=ids.random_session_id)
     tenant_id: str = field(default_factory=ids.random_tenant)
     region: str = field(default_factory=ids.random_region)
-    feature_flag: str = field(default_factory=lambda: random.choice(ids.FEATURE_FLAGS))
-    experiment_id: str = field(default_factory=lambda: random.choice(ids.EXPERIMENTS))
+    feature_flag: str = field(
+        default_factory=lambda: random.choice(ids.FEATURE_FLAGS)
+    )
+    experiment_id: str = field(
+        default_factory=lambda: random.choice(ids.EXPERIMENTS)
+    )
     request_id: str = field(default_factory=ids.random_request_id)
     user_agent: str = field(default_factory=ids.random_user_agent)
     client_ip: str = field(default_factory=lambda: ids.random_ip(private=False))
@@ -50,7 +78,7 @@ class Biz:
             self.user_email = ids.random_email(self.customer_id)
 
     def span_attrs(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
-        payload = attrs.business(
+        return attrs.business(
             customer_id=self.customer_id,
             order_id=self.order_id,
             sku=self.sku,
@@ -68,44 +96,6 @@ class Biz:
                 **(extra or {}),
             },
         )
-        return payload
-
-
-def _sleep_ms(low_ms: float, high_ms: float) -> float:
-    duration_s = random.uniform(low_ms, high_ms) / 1000.0
-    # Cap wall-clock sleep so high --rate values can be honored.
-    from nr_traces import config
-
-    if config.TRACES_PER_SECOND >= 20:
-        time.sleep(min(duration_s, 0.002))
-    elif config.TRACES_PER_SECOND >= 10:
-        time.sleep(min(duration_s, 0.008))
-    else:
-        time.sleep(duration_s)
-    return duration_s
-
-
-def _apply(span, biz: Biz, extra: dict[str, Any] | None = None) -> None:
-    for key, value in biz.span_attrs(extra).items():
-        span.set_attribute(key, value)
-
-
-def _mark_error(span, message: str, exc: BaseException | None = None) -> None:
-    span.set_status(Status(StatusCode.ERROR, message))
-    if exc is not None:
-        span.record_exception(exc)
-        span.set_attribute("error.type", type(exc).__name__)
-        span.set_attribute("error.message", str(exc))
-        span.set_attribute("exception.stacktrace", "".join(
-            [
-                f"{type(exc).__name__}: {exc}\n",
-                '  File "app.py", line 214, in handler\n',
-                "    raise\n",
-            ]
-        ))
-    else:
-        span.set_attribute("error.type", "Error")
-        span.set_attribute("error.message", message)
 
 
 def _merge(*parts: dict[str, Any]) -> dict[str, Any]:
@@ -115,775 +105,1103 @@ def _merge(*parts: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def checkout_happy_path(session: OtlpSession) -> str:
-    biz = Biz()
-    total_duration = 0.0
-    qty = random.randint(1, 4)
+def _mark_error(span, message: str, exc: BaseException | None = None) -> None:
+    span.set_status(Status(StatusCode.ERROR, message))
+    if exc is not None:
+        span.record_exception(exc)
+        span.set_attribute("error.type", type(exc).__name__)
+        span.set_attribute("error.message", str(exc))
+    else:
+        span.set_attribute("error.type", "Error")
+        span.set_attribute("error.message", message)
 
-    gateway_tracer = session.tracer("demo-api-gateway")
-    orders_tracer = session.tracer("demo-orders-service")
-    payment_tracer = session.tracer("demo-payment-service")
 
-    with gateway_tracer.start_as_current_span(
-        "POST /api/v1/checkout",
-        kind=SpanKind.SERVER,
-        attributes=_merge(
+def _age_ns() -> int:
+    """Random age within TIME_SPREAD_MINUTES for chart bucket coverage."""
+    minutes = max(0, config.TIME_SPREAD_MINUTES)
+    if minutes <= 0:
+        return 0
+    # Bias toward recent (last 15m) but still fill older buckets.
+    if random.random() < 0.55:
+        span_min = random.uniform(0, min(15, minutes))
+    else:
+        span_min = random.uniform(0, minutes)
+    return int(span_min * 60 * 1_000_000_000)
+
+
+def _duration_ns(lo_ms: float, hi_ms: float) -> int:
+    return int(random.uniform(lo_ms, hi_ms) * 1_000_000)
+
+
+@contextmanager
+def _timed_span(
+    tracer,
+    name: str,
+    *,
+    kind: SpanKind,
+    attributes: dict[str, Any],
+    start_ns: int,
+    duration_ns: int,
+    parent_ctx=None,
+) -> Iterator[Any]:
+    """Start/end with explicit timestamps (no wall-clock sleep)."""
+    span = tracer.start_span(
+        name,
+        kind=kind,
+        attributes=attributes,
+        context=parent_ctx,
+        start_time=start_ns,
+    )
+    token = otel_context.attach(trace.set_span_in_context(span))
+    try:
+        yield span
+    finally:
+        span.end(end_time=start_ns + duration_ns)
+        otel_context.detach(token)
+
+
+def _http_status_for_peer(peer: PeerSpec) -> tuple[int, bool]:
+    """Return (http_status, otel_error).
+
+    Distinguishes:
+      - HTTP-aware errors (4xx/5xx, no OTel ERROR)
+      - OTel ERROR (status ERROR)
+      - Healthy 200
+    """
+    if random.random() < peer.error_rate:
+        return random.choice((500, 502, 503)), True
+    if random.random() < peer.http_error_rate:
+        return random.choice((400, 404, 422, 500, 502)), False
+    return 200, False
+
+
+def _strip_db(attrs_map: dict[str, Any]) -> dict[str, Any]:
+    attrs_map.pop("db.system", None)
+    attrs_map.pop("db.system.name", None)
+    return attrs_map
+
+
+def _root_txn_attrs(txn: TxnSpec, biz: Biz, status_code: int = 200) -> tuple[SpanKind, dict[str, Any]]:
+    """Build SERVER/CONSUMER attributes for a multi-protocol transaction."""
+    kind = txn.kind
+
+    if kind == "http":
+        method = txn.http_method or "GET"
+        route = txn.http_route or "/"
+        return SpanKind.SERVER, _merge(
             attrs.http_server(
-                method="POST",
-                route="/api/v1/checkout",
-                status_code=200,
-                target="/api/v1/checkout",
-                query=f"tenant={biz.tenant_id}",
+                method=method,
+                route=route,
+                status_code=status_code,
+                scheme=txn.http_scheme or "https",
                 user_agent=biz.user_agent,
                 client_ip=biz.client_ip,
-                request_bytes=random.randint(900, 4200),
-                response_bytes=random.randint(600, 1800),
             ),
-            attrs.code_location(namespace="gateway.http.checkout", function="create_checkout"),
-            biz.span_attrs({"http.route.matched": "checkout.create"}),
-        ),
-    ) as gateway_span:
-        trace_id = gateway_span.get_span_context().trace_id
-        gateway_span_id = gateway_span.get_span_context().span_id
-        gateway_span.add_event(
-            "checkout.started",
-            {"order.id": biz.order_id, "cart.items": qty},
+            biz.span_attrs({"txn.protocol": "http"}),
         )
 
-        orders_ctx = session.parent_context(trace_id, gateway_span_id)
-        with orders_tracer.start_as_current_span(
-            "POST /internal/orders",
-            context=orders_ctx,
-            kind=SpanKind.SERVER,
-            attributes=_merge(
-                attrs.http_server(
-                    method="POST",
-                    route="/internal/orders",
-                    status_code=201,
-                    host="orders.demo.internal",
-                    scheme="http",
-                    server_port=8080,
-                    flavor="1.1",
-                    user_agent="demo-api-gateway/2.8.1",
-                    client_ip=ids.random_ip(),
-                    request_bytes=random.randint(700, 2200),
-                    response_bytes=random.randint(400, 1100),
+    if kind in ("grpc", "connect_rpc", "dubbo"):
+        rpc_attrs = attrs.rpc_client(
+            system=txn.rpc_system or kind,
+            service=txn.rpc_service or "Service",
+            method=txn.rpc_method or "Call",
+            peer="0.0.0.0",
+            port=50051 if kind == "grpc" else 8080,
+            grpc_status=0 if kind == "grpc" else None,
+            peer_service=None,
+        )
+        rpc_attrs.pop("peer.service", None)
+        for key in list(rpc_attrs):
+            if key.startswith("http.") or key.startswith("url.") or key.startswith("messaging."):
+                rpc_attrs.pop(key, None)
+        return SpanKind.SERVER, _merge(rpc_attrs, biz.span_attrs({"txn.protocol": kind}))
+
+    if kind == "graphql":
+        route = txn.http_route or "/graphql"
+        g = attrs.http_server(
+            method=txn.http_method or "POST",
+            route=route,
+            status_code=status_code,
+            scheme=txn.http_scheme or "https",
+            user_agent=biz.user_agent,
+            client_ip=biz.client_ip,
+        )
+        g.update(
+            {
+                "graphql.operation.name": txn.graphql_operation or "Anonymous",
+                "graphql.operation.type": txn.graphql_type or "query",
+                "graphql.document": (
+                    f"{txn.graphql_type or 'query'} {txn.graphql_operation or 'Anonymous'} {{ ... }}"
                 ),
-                attrs.code_location(namespace="orders.api", function="create_order"),
+            }
+        )
+        return SpanKind.SERVER, _merge(g, biz.span_attrs({"txn.protocol": "graphql"}))
+
+    if kind in ("kafka", "rabbitmq", "sqs") or txn.messaging_system:
+        system = txn.messaging_system or kind
+        dest = txn.messaging_destination or txn.name
+        op = txn.messaging_operation or "process"
+        msg = attrs.messaging(
+            system=system,
+            destination=dest,
+            operation=op,
+            destination_kind="queue" if system in ("sqs", "rabbitmq") else "topic",
+            peer_service=None,
+        )
+        msg.pop("peer.service", None)
+        for key in list(msg):
+            if key.startswith("http.") or key.startswith("url.") or key.startswith("graphql."):
+                msg.pop(key, None)
+        return SpanKind.CONSUMER, _merge(msg, biz.span_attrs({"txn.protocol": system}))
+
+    if kind == "websocket":
+        route = txn.http_route or "/ws"
+        ws = attrs.http_server(
+            method="GET",
+            route=route,
+            status_code=101,
+            scheme="https",
+            user_agent=biz.user_agent,
+            client_ip=biz.client_ip,
+        )
+        ws.update(
+            {
+                "messaging.system": "websocket",
+                "messaging.operation": "receive",
+                "messaging.destination": route,
+                "messaging.destination.name": route,
+            }
+        )
+        return SpanKind.SERVER, _merge(ws, biz.span_attrs({"txn.protocol": "websocket"}))
+
+    return SpanKind.SERVER, biz.span_attrs({"txn.protocol": "other"})
+
+
+def _emit_external_client(
+    session: OtlpSession,
+    *,
+    tracer,
+    parent_ctx,
+    peer: PeerSpec,
+    biz: Biz,
+    start_ns: int,
+) -> float:
+    """Emit one CLIENT/PRODUCER span for External tab. Returns duration seconds."""
+    duration_ns = _duration_ns(*peer.latency_ms)
+    duration_s = duration_ns / 1e9
+    kind = peer.kind
+
+    if kind == "nameless":
+        with _timed_span(
+            tracer,
+            "CLIENT anonymous",
+            kind=SpanKind.CLIENT,
+            attributes=_merge(
+                {
+                    "http.request.method": "GET",
+                    "http.method": "GET",
+                    "http.response.status_code": 200,
+                    "http.status_code": 200,
+                },
                 biz.span_attrs(),
             ),
-        ) as orders_span:
-            orders_span_id = orders_span.get_span_context().span_id
+            start_ns=start_ns,
+            duration_ns=duration_ns,
+            parent_ctx=parent_ctx,
+        ):
+            pass
+        return duration_s
 
-            validate_ctx = session.parent_context(trace_id, orders_span_id)
-            with orders_tracer.start_as_current_span(
-                "validate_cart",
-                context=validate_ctx,
-                kind=SpanKind.INTERNAL,
-                attributes=_merge(
-                    attrs.code_location(
-                        namespace="orders.domain.cart", function="validate_cart"
-                    ),
-                    biz.span_attrs({"cart.item_count": qty}),
-                ),
-            ):
-                total_duration += _sleep_ms(2, 12)
+    # --- HTTP family (http / https / peer naming edges) ---
+    if kind in ("http", "https", "peer_only", "net_only", "conflict"):
+        status, otel_err = _http_status_for_peer(peer)
+        # Recipe: payments HTTP → GET /charge for entity_type=http discovery
+        if peer.peer_service == "payments" and peer.route == "/charge":
+            method = "GET"
+            route = "/charge"
+        else:
+            method = random.choice(("GET", "POST", "PUT", "PATCH"))
+            route = peer.route or f"/v1/{peer.name or 'call'}"
+        host = peer.host or "unknown.demo.internal"
+        scheme = peer.scheme or ("https" if kind == "https" or peer.port == 443 else "http")
+        flavor = peer.flavor or ("2.0" if scheme == "https" else "1.1")
+        url = f"{scheme}://{host}{route}"
 
-            redis_ctx = session.parent_context(trace_id, orders_span_id)
-            cache_hit = random.random() < 0.65
-            with orders_tracer.start_as_current_span(
-                "GET cart",
-                context=redis_ctx,
-                kind=SpanKind.CLIENT,
-                attributes=_merge(
-                    attrs.redis_client(
-                        operation="GET",
-                        statement=f"GET cart:{biz.customer_id}",
-                        namespace="cart",
-                        peer="redis-cart.demo.internal",
-                        args_length=1,
-                        cache_hit=cache_hit,
-                    ),
-                    attrs.code_location(
-                        namespace="orders.cache.redis", function="get_cart"
-                    ),
-                    biz.span_attrs(),
-                ),
-            ) as redis_span:
-                redis_span.add_event(
-                    "cache.hit" if cache_hit else "cache.miss",
-                    {"cache.key": f"cart:{biz.customer_id}"},
-                )
-                total_duration += _sleep_ms(1, 8)
+        client_attrs = attrs.http_client(
+            method=method,
+            url=url,
+            status_code=status,
+            peer=peer.net_peer_name or host or None,
+            port=peer.port or None,
+            peer_service=peer.peer_service,
+            flavor=flavor,
+        )
+        # Ensure classic HTTP discovery columns are present
+        client_attrs["http.method"] = method
+        client_attrs["http.request.method"] = method
+        client_attrs["http.route"] = route
+        client_attrs["http.target"] = route
+        if kind == "peer_only":
+            client_attrs.pop("net.peer.name", None)
+            client_attrs.pop("server.address", None)
+            if peer.peer_service:
+                client_attrs["peer.service"] = peer.peer_service
+        elif kind == "net_only":
+            client_attrs.pop("peer.service", None)
+            if peer.net_peer_name:
+                client_attrs["net.peer.name"] = peer.net_peer_name
+                client_attrs["server.address"] = peer.net_peer_name
+        elif kind == "conflict":
+            if peer.peer_service:
+                client_attrs["peer.service"] = peer.peer_service
+            if peer.net_peer_name:
+                client_attrs["net.peer.name"] = peer.net_peer_name
+                client_attrs["server.address"] = peer.net_peer_name
 
-            for name, db_attrs, ns, fn, lo, hi in (
-                (
-                    "SELECT customers",
-                    attrs.db_client(
-                        system="postgresql",
-                        operation="SELECT",
-                        db_name="orders_db",
-                        sql_table="customers",
-                        statement="SELECT id, email, loyalty_tier FROM customers WHERE id = $1",
-                        peer="postgresql-orders.demo.internal",
-                        user="orders_app",
-                        rows_affected=1,
-                    ),
-                    "orders.repo.customers",
-                    "get_customer",
-                    3,
-                    14,
-                ),
-                (
-                    "SELECT orders",
-                    attrs.db_client(
-                        system="postgresql",
-                        operation="SELECT",
-                        db_name="orders_db",
-                        sql_table="orders",
-                        statement="SELECT * FROM orders WHERE customer_id = $1 AND status = $2",
-                        peer="postgresql-orders.demo.internal",
-                        user="orders_app",
-                        rows_affected=random.randint(0, 3),
-                    ),
-                    "orders.repo.orders",
-                    "list_open_orders",
-                    4,
-                    18,
-                ),
-                (
-                    "INSERT orders",
-                    attrs.db_client(
-                        system="postgresql",
-                        operation="INSERT",
-                        db_name="orders_db",
-                        sql_table="orders",
-                        statement=(
-                            "INSERT INTO orders (id, customer_id, sku, amount_cents, currency) "
-                            "VALUES ($1, $2, $3, $4, $5) RETURNING id"
-                        ),
-                        peer="postgresql-orders.demo.internal",
-                        user="orders_app",
-                        rows_affected=1,
-                    ),
-                    "orders.repo.orders",
-                    "insert_order",
-                    5,
-                    20,
-                ),
-                (
-                    "INSERT order_items",
-                    attrs.db_client(
-                        system="postgresql",
-                        operation="INSERT",
-                        db_name="orders_db",
-                        sql_table="order_items",
-                        statement=(
-                            "INSERT INTO order_items (order_id, sku, qty, unit_cents) "
-                            "VALUES ($1, $2, $3, $4)"
-                        ),
-                        peer="postgresql-orders.demo.internal",
-                        user="orders_app",
-                        rows_affected=qty,
-                    ),
-                    "orders.repo.items",
-                    "insert_items",
-                    3,
-                    12,
-                ),
-            ):
-                db_ctx = session.parent_context(trace_id, orders_span_id)
-                with orders_tracer.start_as_current_span(
-                    name,
-                    context=db_ctx,
-                    kind=SpanKind.CLIENT,
-                    attributes=_merge(
-                        db_attrs,
-                        attrs.code_location(namespace=ns, function=fn),
-                        biz.span_attrs(),
-                    ),
-                ):
-                    total_duration += _sleep_ms(lo, hi)
-
-            inv_ctx = session.parent_context(trace_id, orders_span_id)
-            inv_duration = _sleep_ms(8, 28)
-            inv_url = (
-                f"http://inventory.demo.internal:8080/stock/{biz.sku}"
-                f"?warehouse={biz.region}&qty={qty}"
-            )
-            with orders_tracer.start_as_current_span(
-                "GET inventory",
-                context=inv_ctx,
-                kind=SpanKind.CLIENT,
-                attributes=_merge(
-                    attrs.http_client(
-                        method="GET",
-                        url=inv_url,
-                        status_code=200,
-                        peer="inventory.demo.internal",
-                        port=8080,
-                        peer_service="demo-inventory-service",
-                        user_agent="demo-orders-service/1.19.4",
-                        response_bytes=random.randint(180, 640),
-                    ),
-                    attrs.code_location(
-                        namespace="orders.clients.inventory", function="check_stock"
-                    ),
-                    biz.span_attrs({"inventory.warehouse": biz.region, "inventory.qty": qty}),
-                ),
-            ):
-                pass
-            session.record_http_client(
-                service_name="demo-orders-service",
-                duration_s=inv_duration,
-                method="GET",
-                url=inv_url,
-                status_code=200,
-            )
-            total_duration += inv_duration
-
-            pay_ctx = session.parent_context(trace_id, orders_span_id)
-            pay_duration = _sleep_ms(18, 55)
-            stripe_url = "https://api.stripe.com/v1/payment_intents"
-            with payment_tracer.start_as_current_span(
-                "POST stripe.payment_intents",
-                context=pay_ctx,
-                kind=SpanKind.CLIENT,
-                attributes=_merge(
-                    attrs.http_client(
-                        method="POST",
-                        url=stripe_url,
-                        status_code=200,
-                        peer="api.stripe.com",
-                        port=443,
-                        peer_service="stripe",
-                        user_agent="Stripe/v1 PythonBindings/7.8.0",
-                        request_bytes=random.randint(400, 1200),
-                        response_bytes=random.randint(800, 2400),
-                    ),
-                    attrs.code_location(
-                        namespace="payments.stripe", function="create_payment_intent"
-                    ),
-                    biz.span_attrs(
-                        {
-                            "stripe.charge_id": "ch_" + biz.order_id[4:],
-                            "stripe.payment_intent": "pi_" + biz.order_id[4:],
-                            "peer.service": "stripe",
-                        }
-                    ),
-                ),
-            ):
-                pass
-            session.record_http_client(
-                service_name="demo-payment-service",
-                duration_s=pay_duration,
-                method="POST",
-                url=stripe_url,
-                status_code=200,
-            )
-            total_duration += pay_duration
-
-            kafka_ctx = session.parent_context(trace_id, orders_span_id)
-            with orders_tracer.start_as_current_span(
-                "publish orders.completed",
-                context=kafka_ctx,
-                kind=SpanKind.PRODUCER,
-                attributes=_merge(
-                    attrs.messaging(
-                        system="kafka",
-                        destination="orders.completed",
-                        operation="publish",
-                        destination_kind="topic",
-                    ),
-                    biz.span_attrs({"messaging.kafka.partition": random.randint(0, 11)}),
-                ),
-            ):
-                total_duration += _sleep_ms(2, 10)
-
-            total_duration += _sleep_ms(8, 22)
-
-        total_duration += _sleep_ms(12, 35)
-        gateway_span.add_event("checkout.succeeded", {"order.id": biz.order_id})
-
-    session.record_http_server(
-        service_name="demo-api-gateway",
-        duration_s=total_duration,
-        method="POST",
-        route="/api/v1/checkout",
-        status_code=200,
-    )
-    return format_trace_id(trace_id)
-
-
-def checkout_payment_failure(session: OtlpSession) -> str:
-    """5xx + span ERROR — counted as NR-default errors."""
-    biz = Biz()
-    gateway_tracer = session.tracer("demo-api-gateway")
-    orders_tracer = session.tracer("demo-orders-service")
-    payment_tracer = session.tracer("demo-payment-service")
-    total_duration = 0.0
-    status_code = random.choice([500, 502, 503])
-
-    with gateway_tracer.start_as_current_span(
-        "POST /api/v1/checkout",
-        kind=SpanKind.SERVER,
-        attributes=_merge(
-            attrs.http_server(
-                method="POST",
-                route="/api/v1/checkout",
-                status_code=status_code,
-                user_agent=biz.user_agent,
-                client_ip=biz.client_ip,
-            ),
-            attrs.code_location(namespace="gateway.http.checkout", function="create_checkout"),
-            biz.span_attrs(),
-        ),
-    ) as gateway_span:
-        trace_id = gateway_span.get_span_context().trace_id
-        gateway_span_id = gateway_span.get_span_context().span_id
-
-        orders_ctx = session.parent_context(trace_id, gateway_span_id)
-        with orders_tracer.start_as_current_span(
-            "POST /internal/orders",
-            context=orders_ctx,
-            kind=SpanKind.SERVER,
-            attributes=_merge(
-                attrs.http_server(
-                    method="POST",
-                    route="/internal/orders",
-                    status_code=status_code,
-                    host="orders.demo.internal",
-                    scheme="http",
-                    server_port=8080,
-                    user_agent="demo-api-gateway/2.8.1",
-                    client_ip=ids.random_ip(),
-                ),
-                biz.span_attrs(),
-            ),
-        ) as orders_span:
-            orders_span_id = orders_span.get_span_context().span_id
-
-            db_ctx = session.parent_context(trace_id, orders_span_id)
-            with orders_tracer.start_as_current_span(
-                "SELECT payments",
-                context=db_ctx,
-                kind=SpanKind.CLIENT,
-                attributes=_merge(
-                    attrs.db_client(
-                        system="postgresql",
-                        operation="SELECT",
-                        db_name="orders_db",
-                        sql_table="payments",
-                        statement="SELECT id, status FROM payments WHERE order_id = $1",
-                        peer="postgresql-orders.demo.internal",
-                        rows_affected=0,
-                    ),
-                    biz.span_attrs(),
-                ),
-            ):
-                total_duration += _sleep_ms(4, 16)
-
-            pay_ctx = session.parent_context(trace_id, orders_span_id)
-            pay_duration = _sleep_ms(24, 80)
-            stripe_url = "https://api.stripe.com/v1/charges"
-            with payment_tracer.start_as_current_span(
-                "POST stripe.charges",
-                context=pay_ctx,
-                kind=SpanKind.CLIENT,
-                attributes=_merge(
-                    attrs.http_client(
-                        method="POST",
-                        url=stripe_url,
-                        status_code=502,
-                        peer="api.stripe.com",
-                        port=443,
-                        peer_service="stripe",
-                        user_agent="Stripe/v1 PythonBindings/7.8.0",
-                        resend_count=2,
-                    ),
-                    biz.span_attrs({"stripe.error.code": "api_connection_error"}),
-                ),
-            ) as pay_span:
-                pay_span.add_event("http.retry", {"http.request.resend_count": 1})
-                pay_span.add_event("http.retry", {"http.request.resend_count": 2})
+        _strip_db(client_attrs)
+        with _timed_span(
+            tracer,
+            f"{method} {peer.name or host}",
+            kind=SpanKind.CLIENT,
+            attributes=_merge(client_attrs, biz.span_attrs()),
+            start_ns=start_ns,
+            duration_ns=duration_ns,
+            parent_ctx=parent_ctx,
+        ) as span:
+            if otel_err:
                 _mark_error(
-                    pay_span,
-                    "Payment gateway unavailable",
-                    RuntimeError("Payment gateway returned 502 Bad Gateway"),
+                    span,
+                    f"{peer.name or host} failed",
+                    RuntimeError(f"upstream returned {status}"),
                 )
-            session.record_http_client(
-                service_name="demo-payment-service",
-                duration_s=pay_duration,
-                method="POST",
-                url=stripe_url,
-                status_code=502,
-            )
-            total_duration += pay_duration
-            _mark_error(orders_span, "checkout failed")
-            total_duration += _sleep_ms(8, 20)
+        session.record_http_client(
+            service_name=PRIMARY_SERVICE,
+            duration_s=duration_s,
+            method=method,
+            url=url,
+            status_code=status,
+        )
+        return duration_s
 
-        _mark_error(gateway_span, "checkout failed")
-        total_duration += _sleep_ms(20, 50)
-
-    session.record_http_server(
-        service_name="demo-api-gateway",
-        duration_s=total_duration,
-        method="POST",
-        route="/api/v1/checkout",
-        status_code=status_code,
-    )
-    return format_trace_id(trace_id)
-
-
-def checkout_client_error(session: OtlpSession) -> str:
-    """4xx only — should NOT inflate NR-default error rate (5xx+exceptions)."""
-    biz = Biz()
-    gateway_tracer = session.tracer("demo-api-gateway")
-    total_duration = 0.0
-    status_code = random.choice([400, 404, 422])
-
-    with gateway_tracer.start_as_current_span(
-        "POST /api/v1/checkout",
-        kind=SpanKind.SERVER,
-        attributes=_merge(
-            attrs.http_server(
-                method="POST",
-                route="/api/v1/checkout",
-                status_code=status_code,
-                user_agent=biz.user_agent,
-                client_ip=biz.client_ip,
-                response_bytes=random.randint(180, 500),
-            ),
-            biz.span_attrs({"error.expected": True, "http.status_reason": "client_error"}),
-        ),
-    ) as gateway_span:
-        trace_id = gateway_span.get_span_context().trace_id
-        _apply(gateway_span, biz)
-        total_duration += _sleep_ms(4, 18)
-
-    session.record_http_server(
-        service_name="demo-api-gateway",
-        duration_s=total_duration,
-        method="POST",
-        route="/api/v1/checkout",
-        status_code=status_code,
-    )
-    return format_trace_id(trace_id)
-
-
-def auth_slow_trace(session: OtlpSession) -> str:
-    """Slow SERVER txn + redis CLIENT for apdex / slowest_avg cards."""
-    biz = Biz(feature_flag="slow_auth_path")
-    auth_tracer = session.tracer("demo-auth-service")
-    total_duration = 0.0
-
-    with auth_tracer.start_as_current_span(
-        "GET /auth/verify",
-        kind=SpanKind.SERVER,
-        attributes=_merge(
-            attrs.http_server(
-                method="GET",
-                route="/auth/verify",
-                status_code=200,
-                host="auth.demo.shop",
-                target=f"/auth/verify?session={biz.session_id}",
-                query=f"session={biz.session_id}",
-                user_agent=biz.user_agent,
-                client_ip=biz.client_ip,
-            ),
-            attrs.code_location(namespace="auth.verify", function="verify_session"),
-            biz.span_attrs(),
-        ),
-    ) as auth_span:
-        trace_id = auth_span.get_span_context().trace_id
-        auth_span_id = auth_span.get_span_context().span_id
-
-        redis_ctx = session.parent_context(trace_id, auth_span_id)
-        with auth_tracer.start_as_current_span(
-            "GET session",
-            context=redis_ctx,
+    if kind == "graphql":
+        status, otel_err = _http_status_for_peer(peer)
+        host = peer.host
+        url = f"{peer.scheme or 'https'}://{host}{peer.route or '/graphql'}"
+        g_attrs = attrs.graphql_client(
+            url=url,
+            operation_name=peer.graphql_operation or "Anonymous",
+            operation_type=peer.graphql_type or "query",
+            status_code=status,
+            peer_service=peer.peer_service or peer.name,
+        )
+        # graphql_http: HTTP fields + GraphQL fields
+        g_attrs["http.method"] = "POST"
+        g_attrs["http.request.method"] = "POST"
+        g_attrs["http.route"] = peer.route or "/graphql"
+        _strip_db(g_attrs)
+        with _timed_span(
+            tracer,
+            f"GraphQL {peer.graphql_operation or peer.name}",
             kind=SpanKind.CLIENT,
-            attributes=_merge(
-                attrs.redis_client(
-                    operation="GET",
-                    statement=f"GET session:{biz.session_id}",
-                    namespace="session",
-                    peer="redis-auth-cache.demo.internal",
-                    db_index=2,
-                    args_length=1,
-                    cache_hit=False,
-                ),
-                biz.span_attrs(),
-            ),
-        ):
-            total_duration += _sleep_ms(80, 220)
+            attributes=_merge(g_attrs, biz.span_attrs()),
+            start_ns=start_ns,
+            duration_ns=duration_ns,
+            parent_ctx=parent_ctx,
+        ) as span:
+            if otel_err:
+                _mark_error(span, "graphql error", RuntimeError("GraphQL upstream error"))
+        return duration_s
 
-        pg_ctx = session.parent_context(trace_id, auth_span_id)
-        with auth_tracer.start_as_current_span(
-            "SELECT users",
-            context=pg_ctx,
+    if kind == "soap":
+        status, otel_err = _http_status_for_peer(peer)
+        host = peer.host
+        url = f"{peer.scheme or 'https'}://{host}{peer.route or '/soap'}"
+        s_attrs = attrs.soap_client(
+            url=url,
+            action=peer.soap_action or "Execute",
+            status_code=status,
+            peer_service=peer.peer_service or peer.name,
+        )
+        _strip_db(s_attrs)
+        with _timed_span(
+            tracer,
+            f"SOAP {peer.soap_action or peer.name}",
             kind=SpanKind.CLIENT,
-            attributes=_merge(
-                attrs.db_client(
-                    system="postgresql",
-                    operation="SELECT",
-                    db_name="auth_db",
-                    sql_table="users",
-                    statement=(
-                        "SELECT id, email, mfa_enabled, last_login_at FROM users WHERE id = $1"
-                    ),
-                    peer="postgresql-auth.demo.internal",
-                    user="auth_app",
-                    rows_affected=1,
-                ),
-                attrs.code_location(namespace="auth.repo.users", function="get_user"),
-                biz.span_attrs(),
-            ),
-        ):
-            total_duration += _sleep_ms(12, 40)
+            attributes=_merge(s_attrs, biz.span_attrs()),
+            start_ns=start_ns,
+            duration_ns=duration_ns,
+            parent_ctx=parent_ctx,
+        ) as span:
+            if otel_err:
+                _mark_error(span, "soap fault", RuntimeError("SOAP Fault"))
+        return duration_s
 
-        idp_ctx = session.parent_context(trace_id, auth_span_id)
-        idp_url = "https://idp.okta.com/oauth2/v1/introspect"
-        idp_duration = _sleep_ms(40, 120)
-        with auth_tracer.start_as_current_span(
-            "POST okta.introspect",
-            context=idp_ctx,
+    if kind == "websocket":
+        url = f"{peer.scheme or 'wss'}://{peer.host}{peer.route or '/ws'}"
+        ws_attrs = attrs.websocket_client(
+            url=url,
+            peer_service=peer.peer_service or peer.name,
+        )
+        _strip_db(ws_attrs)
+        with _timed_span(
+            tracer,
+            f"WS {peer.name}",
             kind=SpanKind.CLIENT,
-            attributes=_merge(
-                attrs.http_client(
-                    method="POST",
-                    url=idp_url,
-                    status_code=200,
-                    peer="idp.okta.com",
-                    port=443,
-                    peer_service="okta",
-                    user_agent="demo-auth-service/4.1.0",
-                ),
-                biz.span_attrs({"idp.issuer": "https://idp.okta.com"}),
-            ),
+            attributes=_merge(ws_attrs, biz.span_attrs()),
+            start_ns=start_ns,
+            duration_ns=duration_ns,
+            parent_ctx=parent_ctx,
         ):
             pass
-        session.record_http_client(
-            service_name="demo-auth-service",
-            duration_s=idp_duration,
-            method="POST",
-            url=idp_url,
-            status_code=200,
+        return duration_s
+
+    # --- RPC family ---
+    if kind in ("grpc", "connect_rpc", "dubbo", "jsonrpc", "java_rmi"):
+        rpc_system = peer.rpc_system or {
+            "grpc": "grpc",
+            "connect_rpc": "connect_rpc",
+            "dubbo": "apache_dubbo",
+            "jsonrpc": "jsonrpc",
+            "java_rmi": "java_rmi",
+        }[kind]
+        otel_err = random.random() < peer.error_rate
+        grpc_status = None
+        if kind == "grpc":
+            grpc_status = random.choice((2, 4, 13, 14)) if otel_err else 0
+        rpc_attrs = attrs.rpc_client(
+            system=rpc_system,
+            service=peer.rpc_service or f"{peer.name}.Service",
+            method=peer.rpc_method or "Call",
+            peer=peer.host,
+            port=peer.port,
+            grpc_status=grpc_status,
+            peer_service=peer.peer_service or peer.name,
         )
-        total_duration += idp_duration + _sleep_ms(80, 180)
-
-    session.record_http_server(
-        service_name="demo-auth-service",
-        duration_s=total_duration,
-        method="GET",
-        route="/auth/verify",
-        status_code=200,
-    )
-    return format_trace_id(trace_id)
-
-
-def search_mixed_db(session: OtlpSession) -> str:
-    """Multiple NR-normalized DB keys plus elasticsearch + cache."""
-    biz = Biz(feature_flag="search_v2")
-    gateway_tracer = session.tracer("demo-api-gateway")
-    total_duration = 0.0
-    query = random.choice(("running shoes", "wireless headphones", "office chair", biz.sku))
-
-    with gateway_tracer.start_as_current_span(
-        "GET /api/v1/search",
-        kind=SpanKind.SERVER,
-        attributes=_merge(
-            attrs.http_server(
-                method="GET",
-                route="/api/v1/search",
-                status_code=200,
-                target=f"/api/v1/search?q={query.replace(' ', '+')}&page=1",
-                query=f"q={query}&page=1",
-                user_agent=biz.user_agent,
-                client_ip=biz.client_ip,
-                response_bytes=random.randint(4000, 28000),
-            ),
-            attrs.code_location(namespace="gateway.http.search", function="search_products"),
-            biz.span_attrs({"search.query": query, "search.page": 1}),
-        ),
-    ) as root:
-        trace_id = root.get_span_context().trace_id
-        root_span_id = root.get_span_context().span_id
-
-        db_specs = (
-            (
-                "SELECT products",
-                attrs.db_client(
-                    system="mysql",
-                    operation="SELECT",
-                    db_name="products_db",
-                    sql_table="products",
-                    statement=(
-                        "SELECT id, name, price_cents FROM products "
-                        "WHERE MATCH(name) AGAINST (? IN NATURAL LANGUAGE MODE) LIMIT 50"
-                    ),
-                    peer="mysql-catalog.demo.internal",
-                    user="catalog_ro",
-                    rows_affected=random.randint(8, 50),
-                ),
-            ),
-            (
-                "elasticsearch search",
-                attrs.elasticsearch_client(
-                    operation="search",
-                    index="products",
-                    statement=(
-                        '{"query":{"multi_match":{"query":"%s","fields":["name^3","brand"]}}}'
-                        % query
-                    ),
-                    peer="es-search.demo.internal",
-                ),
-            ),
-            (
-                "mongodb aggregate",
-                attrs.db_client(
-                    system="mongodb",
-                    operation="aggregate",
-                    db_name="catalog",
-                    mongodb_collection="facets",
-                    statement='db.facets.aggregate([{"$match":{"q": "?"}},{"$group":{"_id":"$brand"}}])',
-                    peer="mongodb-catalog.demo.internal",
-                    user="catalog_app",
-                    rows_affected=random.randint(4, 18),
-                ),
-            ),
-            (
-                "GET search_cache",
-                attrs.redis_client(
-                    operation="GET",
-                    statement="GET search:cache:{hash}",
-                    namespace="search_cache",
-                    peer="redis-search.demo.internal",
-                    cache_hit=random.random() < 0.4,
-                ),
-            ),
-        )
-        for name, db_attrs in db_specs:
-            ctx = session.parent_context(trace_id, root_span_id)
-            with gateway_tracer.start_as_current_span(
-                name,
-                context=ctx,
-                kind=SpanKind.CLIENT,
-                attributes=_merge(db_attrs, biz.span_attrs({"search.query": query})),
+        _strip_db(rpc_attrs)
+        # entity_type=grpc: avoid HTTP fields on these spans
+        for key in list(rpc_attrs):
+            if (
+                key.startswith("http.")
+                or key.startswith("url.")
+                or key.startswith("graphql.")
+                or key.startswith("messaging.")
             ):
-                total_duration += _sleep_ms(3, 22)
-
-        rec_ctx = session.parent_context(trace_id, root_span_id)
-        rec_url = "https://recommend.demo-external.com/v2/rank"
-        rec_duration = _sleep_ms(12, 40)
-        with gateway_tracer.start_as_current_span(
-            "POST recommend.rank",
-            context=rec_ctx,
+                rpc_attrs.pop(key, None)
+        with _timed_span(
+            tracer,
+            f"{peer.rpc_service or peer.name}/{peer.rpc_method or 'Call'}",
             kind=SpanKind.CLIENT,
-            attributes=_merge(
-                attrs.http_client(
-                    method="POST",
-                    url=rec_url,
-                    status_code=200,
-                    peer="recommend.demo-external.com",
-                    port=443,
-                    peer_service="recommendations",
-                ),
-                biz.span_attrs({"search.query": query}),
-            ),
+            attributes=_merge(rpc_attrs, biz.span_attrs()),
+            start_ns=start_ns,
+            duration_ns=duration_ns,
+            parent_ctx=parent_ctx,
+        ) as span:
+            if otel_err:
+                _mark_error(
+                    span,
+                    f"{rpc_system} call failed",
+                    RuntimeError(f"{rpc_system} error"),
+                )
+        return duration_s
+
+    # --- Messaging family ---
+    if kind in ("kafka", "rabbitmq", "sqs", "sns", "nats", "mqtt", "pulsar"):
+        system = peer.messaging_system or kind
+        dest = peer.messaging_destination or peer.name
+        op = peer.messaging_operation or "publish"
+        msg_attrs = attrs.messaging(
+            system=system,
+            destination=dest,
+            operation=op,
+            destination_kind=peer.messaging_kind or "topic",
+            region=peer.aws_region,
+            peer_service=peer.peer_service or system,
+            peer_host=peer.host,
+            peer_port=peer.port,
+        )
+        _strip_db(msg_attrs)
+        # entity_type=kafka: no HTTP / GraphQL noise
+        for key in list(msg_attrs):
+            if key.startswith("http.") or key.startswith("url.") or key.startswith("graphql."):
+                msg_attrs.pop(key, None)
+        # Hard rule: External spans use span_kind=CLIENT (3)
+        with _timed_span(
+            tracer,
+            f"{op} {dest}",
+            kind=SpanKind.CLIENT,
+            attributes=_merge(msg_attrs, biz.span_attrs()),
+            start_ns=start_ns,
+            duration_ns=duration_ns,
+            parent_ctx=parent_ctx,
         ):
             pass
-        session.record_http_client(
-            service_name="demo-api-gateway",
-            duration_s=rec_duration,
-            method="POST",
-            url=rec_url,
-            status_code=200,
+        return duration_s
+
+    # --- AWS ---
+    if kind == "aws_s3":
+        region = peer.aws_region or biz.region
+        bucket = peer.s3_bucket or "demo-order-receipts"
+        key = (peer.s3_key or "receipts/{order_id}.pdf").replace("{order_id}", biz.order_id)
+        status, otel_err = _http_status_for_peer(peer)
+        s3_attrs = attrs.s3_client(
+            operation=peer.aws_operation or "PutObject",
+            bucket=bucket,
+            key=key,
+            region=region,
+            status_code=status,
         )
-        total_duration += rec_duration + _sleep_ms(8, 24)
+        if peer.peer_service:
+            s3_attrs["peer.service"] = peer.peer_service
+        _strip_db(s3_attrs)
+        with _timed_span(
+            tracer,
+            f"S3 {peer.aws_operation or 'PutObject'}",
+            kind=SpanKind.CLIENT,
+            attributes=_merge(s3_attrs, biz.span_attrs()),
+            start_ns=start_ns,
+            duration_ns=duration_ns,
+            parent_ctx=parent_ctx,
+        ) as span:
+            if otel_err:
+                _mark_error(span, "s3 error", RuntimeError("S3 request failed"))
+        return duration_s
 
-    session.record_http_server(
-        service_name="demo-api-gateway",
-        duration_s=total_duration,
-        method="GET",
-        route="/api/v1/search",
-        status_code=200,
-    )
-    return format_trace_id(trace_id)
+    if kind == "aws_api":
+        status, otel_err = _http_status_for_peer(peer)
+        aws_attrs = attrs.aws_api_client(
+            service=peer.aws_service or "dynamodb",
+            operation=peer.aws_operation or "GetItem",
+            region=peer.aws_region or biz.region,
+            peer_service=peer.peer_service or f"aws.{peer.aws_service or 'dynamodb'}",
+            status_code=status,
+        )
+        _strip_db(aws_attrs)
+        with _timed_span(
+            tracer,
+            f"AWS {peer.aws_service}/{peer.aws_operation}",
+            kind=SpanKind.CLIENT,
+            attributes=_merge(aws_attrs, biz.span_attrs()),
+            start_ns=start_ns,
+            duration_ns=duration_ns,
+            parent_ctx=parent_ctx,
+        ) as span:
+            if otel_err:
+                _mark_error(span, "aws api error", RuntimeError("AWS API error"))
+        return duration_s
+
+    # other — peer_service only; no http / grpc / kafka / graphql fields
+    other_attrs: dict[str, Any] = {
+        "peer.service": peer.peer_service or peer.name or "mystery-peer",
+    }
+    if peer.net_peer_name or peer.host:
+        other_attrs["net.peer.name"] = peer.net_peer_name or peer.host
+        other_attrs["server.address"] = peer.net_peer_name or peer.host
+        if peer.port:
+            other_attrs["server.port"] = peer.port
+    with _timed_span(
+        tracer,
+        f"call {peer.name or 'mystery-peer'}",
+        kind=SpanKind.CLIENT,
+        attributes=_merge(other_attrs, biz.span_attrs()),
+        start_ns=start_ns,
+        duration_ns=duration_ns,
+        parent_ctx=parent_ctx,
+    ):
+        pass
+    return duration_s
 
 
-def db_error_query(session: OtlpSession) -> str:
-    """DB CLIENT span with error status + db_response_status_code 5xx."""
+def _emit_db_client(
+    session: OtlpSession,
+    *,
+    tracer,
+    parent_ctx,
+    op: DbOp,
+    biz: Biz,
+    start_ns: int,
+) -> float:
+    duration_ns = _duration_ns(*op.latency_ms)
+    duration_s = duration_ns / 1e9
+    db_attrs: dict[str, Any]
+    if op.system == "redis":
+        db_attrs = attrs.redis_client(
+            operation=op.operation,
+            statement=op.statement,
+            namespace=op.table,
+            peer=op.peer,
+        )
+    elif op.system == "elasticsearch":
+        db_attrs = attrs.elasticsearch_client(
+            operation=op.operation,
+            statement=op.statement,
+            index=op.table,
+            peer=op.peer,
+        )
+    elif op.system == "mongodb":
+        db_attrs = attrs.db_client(
+            system="mongodb",
+            operation=op.operation,
+            statement=op.statement,
+            db_name=op.db_name,
+            mongodb_collection=op.table,
+            peer=op.peer,
+        )
+    else:
+        db_attrs = attrs.db_client(
+            system=op.system,
+            operation=op.operation,
+            statement=op.statement,
+            db_name=op.db_name,
+            sql_table=op.table,
+            peer=op.peer,
+            rows_affected=random.randint(0, 12),
+        )
+    # DB clients also set peer.service (tracer-style) — must still land in Database.
+    db_attrs["peer.service"] = op.peer.split(".")[0]
+
+    otel_err = random.random() < op.error_rate
+    if otel_err:
+        db_attrs["db.response.status_code"] = "500"
+
+    with _timed_span(
+        tracer,
+        f"{op.operation} {op.table}",
+        kind=SpanKind.CLIENT,
+        attributes=_merge(db_attrs, biz.span_attrs()),
+        start_ns=start_ns,
+        duration_ns=duration_ns,
+        parent_ctx=parent_ctx,
+    ) as span:
+        if otel_err:
+            _mark_error(
+                span,
+                "db query failed",
+                RuntimeError(f"{op.system} error on {op.table}"),
+            )
+    return duration_s
+
+
+# ---------------------------------------------------------------------------
+# Scenarios
+# ---------------------------------------------------------------------------
+
+
+def checkout_external_heavy(session: OtlpSession) -> str:
+    """PRIMARY busy service: multi-protocol SERVER/CONSUMER txn + External + DB.
+
+    Transaction mix (fixed): http 35% / grpc 25% / kafka 15% / graphql 10% / …
+    External mix (fixed): http 40% / grpc 25% / kafka 15% / graphql_http 10% / other 10%.
+    """
     biz = Biz()
-    orders_tracer = session.tracer("demo-orders-service")
-    total_duration = 0.0
+    instance = pick_instance_id(PRIMARY_SERVICE)
+    tracer = session.tracer(PRIMARY_SERVICE, instance)
+    txn = pick_transaction()
+    age = _age_ns()
+    now = time.time_ns()
+    root_start = now - age
 
-    with orders_tracer.start_as_current_span(
-        "POST /internal/orders",
-        kind=SpanKind.SERVER,
+    n_ext = random.choices((2, 3, 4, 5), weights=(10, 35, 35, 20), k=1)[0]
+    n_db = random.choices((0, 1, 2), weights=(25, 50, 25), k=1)[0]
+
+    child_plan: list[tuple[str, Any]] = []
+    for _ in range(n_ext):
+        child_plan.append(("ext", pick_entity_type_peer()))
+    for _ in range(n_db):
+        child_plan.append(("db", pick_db_op()))
+    random.shuffle(child_plan)
+
+    total_child_ms = sum(random.uniform(*spec.latency_ms) for _, spec in child_plan)
+    root_duration_ns = _duration_ns(total_child_ms + 5, total_child_ms + 40)
+
+    server_status = 200
+    if random.random() < 0.04:
+        server_status = random.choice((500, 502))
+    elif random.random() < 0.06:
+        server_status = random.choice((400, 404, 422))
+
+    span_kind, root_attrs = _root_txn_attrs(txn, biz, status_code=server_status)
+    if span_kind != SpanKind.SERVER:
+        # CONSUMER txns: keep OK unless we explicitly error
+        server_status = 200
+
+    with _timed_span(
+        tracer,
+        txn.name,
+        kind=span_kind,
         attributes=_merge(
-            attrs.http_server(
-                method="POST",
-                route="/internal/orders",
-                status_code=500,
-                host="orders.demo.internal",
-                scheme="http",
-                server_port=8080,
-            ),
-            biz.span_attrs(),
+            root_attrs,
+            attrs.code_location(namespace="checkout.handlers", function="handle"),
         ),
+        start_ns=root_start,
+        duration_ns=root_duration_ns,
     ) as root:
         trace_id = root.get_span_context().trace_id
         root_span_id = root.get_span_context().span_id
+        if server_status >= 500 and span_kind == SpanKind.SERVER:
+            _mark_error(root, "request failed")
 
-        db_ctx = session.parent_context(trace_id, root_span_id)
-        with orders_tracer.start_as_current_span(
-            "INSERT orders",
-            context=db_ctx,
-            kind=SpanKind.CLIENT,
-            attributes=_merge(
-                attrs.db_client(
-                    system="postgresql",
-                    operation="INSERT",
-                    db_name="orders_db",
-                    sql_table="orders",
-                    statement="INSERT INTO orders (id, sku, customer_id) VALUES ($1, $2, $3)",
-                    peer="postgresql-orders.demo.internal",
-                    user="orders_app",
-                    response_status="23505",
-                    rows_affected=0,
-                ),
-                attrs.code_location(namespace="orders.repo.orders", function="insert_order"),
-                biz.span_attrs({"db.sql.state": "23505"}),
-            ),
-        ) as db_span:
-            _mark_error(
-                db_span,
-                "unique_violation",
-                RuntimeError("duplicate key value violates unique constraint orders_pkey"),
-            )
-            total_duration += _sleep_ms(8, 28)
+        parent = session.parent_context(trace_id, root_span_id)
+        cursor = root_start + 1_000_000
+        for kind, spec in child_plan:
+            if kind == "ext":
+                d = _emit_external_client(
+                    session,
+                    tracer=tracer,
+                    parent_ctx=parent,
+                    peer=spec,
+                    biz=biz,
+                    start_ns=cursor,
+                )
+            else:
+                d = _emit_db_client(
+                    session,
+                    tracer=tracer,
+                    parent_ctx=parent,
+                    op=spec,
+                    biz=biz,
+                    start_ns=cursor,
+                )
+            cursor += int(d * 1e9) + 500_000
 
-        _mark_error(root, "order insert failed")
-        total_duration += _sleep_ms(4, 14)
-
-    session.record_http_server(
-        service_name="demo-orders-service",
-        duration_s=total_duration,
-        method="POST",
-        route="/internal/orders",
-        status_code=500,
-    )
+    if txn.kind == "http":
+        session.record_http_server(
+            service_name=PRIMARY_SERVICE,
+            duration_s=root_duration_ns / 1e9,
+            method=txn.http_method or "GET",
+            route=txn.http_route or "/",
+            status_code=server_status,
+        )
+    elif txn.messaging_system:
+        session.record_messaging_process(
+            service_name=PRIMARY_SERVICE,
+            duration_s=root_duration_ns / 1e9,
+            system=txn.messaging_system,
+            destination=txn.messaging_destination or txn.name,
+        )
     return format_trace_id(trace_id)
 
 
-def kafka_order_fulfilled(session: OtlpSession) -> str:
-    biz = Biz()
-    worker_tracer = session.tracer("demo-notification-worker")
-    total_duration = 0.0
-    receipt_key = f"receipts/{biz.region}/{biz.order_id}.pdf"
+def entity_type_demo(session: OtlpSession) -> str:
+    """Emit all required entity_type recipes under a multi-protocol txn root.
 
-    with worker_tracer.start_as_current_span(
+    Always includes: payments/http, payments/grpc, inventory/grpc, orders-bus/kafka,
+    catalog-graphql/graphql_http, mystery-peer/other, plus DB negative checks.
+    Root txn mix: http 35% / grpc 25% / kafka 15% / graphql 10% / …
+    """
+    biz = Biz()
+    tracer = session.tracer(PRIMARY_SERVICE, pick_instance_id(PRIMARY_SERVICE))
+    txn = pick_transaction()
+    age = _age_ns()
+    root_start = time.time_ns() - age
+
+    recipe_peers = (
+        ENTITY_TYPE_RECIPES["http"],           # payments + HTTP → http
+        ENTITY_TYPE_RECIPES["grpc_payments"],  # payments + gRPC → dual-type row
+        ENTITY_TYPE_RECIPES["grpc"],           # inventory + gRPC → grpc
+        ENTITY_TYPE_RECIPES["kafka"],          # orders-bus → kafka
+        ENTITY_TYPE_RECIPES["graphql_http"],   # → graphql_http
+        ENTITY_TYPE_RECIPES["other"],          # mystery-peer → other
+        ENTITY_TYPE_RECIPES["http_slow"],      # slow for ranks
+        ENTITY_TYPE_RECIPES["http_fast"],
+        ENTITY_TYPE_RECIPES["http_errors"],    # HTTP 4xx/5xx without OTel ERROR
+    )
+    db_ops = [pick_db_op(), pick_db_op()]  # Database negative check
+
+    total_ms = sum(random.uniform(*p.latency_ms) for p in recipe_peers)
+    total_ms += sum(random.uniform(*o.latency_ms) for o in db_ops)
+    root_duration_ns = _duration_ns(total_ms + 10, total_ms + 50)
+    span_kind, root_attrs = _root_txn_attrs(txn, biz, status_code=200)
+
+    with _timed_span(
+        tracer,
+        txn.name,
+        kind=span_kind,
+        attributes=_merge(
+            root_attrs,
+            biz.span_attrs(
+                {
+                    "scenario": "entity_type_demo",
+                    "entity_type.mix": str(ENTITY_TYPE_PERCENT),
+                }
+            ),
+        ),
+        start_ns=root_start,
+        duration_ns=root_duration_ns,
+    ) as root:
+        trace_id = root.get_span_context().trace_id
+        parent = session.parent_context(trace_id, root.get_span_context().span_id)
+        t = root_start + 1_000_000
+        for peer in recipe_peers:
+            d = _emit_external_client(
+                session, tracer=tracer, parent_ctx=parent, peer=peer, biz=biz, start_ns=t
+            )
+            t += int(d * 1e9) + 300_000
+        for op in db_ops:
+            d = _emit_db_client(
+                session, tracer=tracer, parent_ctx=parent, op=op, biz=biz, start_ns=t
+            )
+            t += int(d * 1e9) + 300_000
+
+    if txn.kind == "http":
+        session.record_http_server(
+            service_name=PRIMARY_SERVICE,
+            duration_s=root_duration_ns / 1e9,
+            method=txn.http_method or "POST",
+            route=txn.http_route or "/api/v1/checkout",
+            status_code=200,
+        )
+    elif txn.messaging_system:
+        session.record_messaging_process(
+            service_name=PRIMARY_SERVICE,
+            duration_s=root_duration_ns / 1e9,
+            system=txn.messaging_system,
+            destination=txn.messaging_destination or txn.name,
+        )
+    return format_trace_id(trace_id)
+
+
+def dual_type_peer_trace(session: OtlpSession) -> str:
+    """payments as HTTP + gRPC in one trace (table: two rows, chart may merge)."""
+    biz = Biz()
+    tracer = session.tracer(PRIMARY_SERVICE, pick_instance_id(PRIMARY_SERVICE))
+    txn = pick_transaction()
+    chosen = (
+        ENTITY_TYPE_RECIPES["http"],
+        ENTITY_TYPE_RECIPES["grpc_payments"],
+    )
+    age = _age_ns()
+    root_start = time.time_ns() - age
+    root_duration_ns = _duration_ns(100, 350)
+    span_kind, root_attrs = _root_txn_attrs(txn, biz, status_code=200)
+
+    with _timed_span(
+        tracer,
+        txn.name,
+        kind=span_kind,
+        attributes=_merge(root_attrs, biz.span_attrs({"dual_type.peer": "payments"})),
+        start_ns=root_start,
+        duration_ns=root_duration_ns,
+    ) as root:
+        trace_id = root.get_span_context().trace_id
+        parent = session.parent_context(trace_id, root.get_span_context().span_id)
+        t = root_start + 2_000_000
+        for peer in chosen:
+            d = _emit_external_client(
+                session, tracer=tracer, parent_ctx=parent, peer=peer, biz=biz, start_ns=t
+            )
+            t += int(d * 1e9) + 1_000_000
+
+    if txn.kind == "http":
+        session.record_http_server(
+            service_name=PRIMARY_SERVICE,
+            duration_s=root_duration_ns / 1e9,
+            method=txn.http_method or "POST",
+            route=txn.http_route or "/api/v1/checkout",
+            status_code=200,
+        )
+    return format_trace_id(trace_id)
+
+
+def protocol_showcase(session: OtlpSession) -> str:
+    """One span per major protocol family under a multi-protocol txn root."""
+    biz = Biz()
+    tracer = session.tracer(PRIMARY_SERVICE, pick_instance_id(PRIMARY_SERVICE))
+    txn = pick_transaction()
+    showcase_kinds = (
+        "https",
+        "http",
+        "graphql",
+        "soap",
+        "websocket",
+        "grpc",
+        "connect_rpc",
+        "dubbo",
+        "jsonrpc",
+        "java_rmi",
+        "kafka",
+        "rabbitmq",
+        "sqs",
+        "sns",
+        "nats",
+        "mqtt",
+        "pulsar",
+        "aws_s3",
+        "aws_api",
+        "other",
+    )
+    samples: list[PeerSpec] = []
+    for k in showcase_kinds:
+        matches = [p for p in catalog.PEERS if p.kind == k]
+        if matches:
+            samples.append(matches[0])
+
+    age = _age_ns()
+    root_start = time.time_ns() - age
+    root_duration_ns = _duration_ns(200, 600)
+    span_kind, root_attrs = _root_txn_attrs(txn, biz, status_code=200)
+
+    with _timed_span(
+        tracer,
+        txn.name,
+        kind=span_kind,
+        attributes=_merge(root_attrs, biz.span_attrs({"scenario": "protocol_showcase"})),
+        start_ns=root_start,
+        duration_ns=root_duration_ns,
+    ) as root:
+        trace_id = root.get_span_context().trace_id
+        parent = session.parent_context(trace_id, root.get_span_context().span_id)
+        t = root_start + 1_000_000
+        for peer in samples:
+            d = _emit_external_client(
+                session, tracer=tracer, parent_ctx=parent, peer=peer, biz=biz, start_ns=t
+            )
+            t += int(d * 1e9) + 200_000
+
+    return format_trace_id(trace_id)
+
+
+def peer_naming_edges(session: OtlpSession) -> str:
+    """peer_only / net_only / conflict / nameless in one request."""
+    biz = Biz()
+    tracer = session.tracer(PRIMARY_SERVICE, pick_instance_id(PRIMARY_SERVICE))
+    txn = pick_transaction()
+    edge_kinds = ("peer_only", "net_only", "conflict", "nameless")
+    edges = [p for p in catalog.PEERS if p.kind in edge_kinds]
+    age = _age_ns()
+    root_start = time.time_ns() - age
+    root_duration_ns = _duration_ns(60, 180)
+    span_kind, root_attrs = _root_txn_attrs(txn, biz, status_code=200)
+
+    with _timed_span(
+        tracer,
+        txn.name,
+        kind=span_kind,
+        attributes=root_attrs,
+        start_ns=root_start,
+        duration_ns=root_duration_ns,
+    ) as root:
+        trace_id = root.get_span_context().trace_id
+        parent = session.parent_context(trace_id, root.get_span_context().span_id)
+        t = root_start + 1_000_000
+        for peer in edges:
+            d = _emit_external_client(
+                session, tracer=tracer, parent_ctx=parent, peer=peer, biz=biz, start_ns=t
+            )
+            t += int(d * 1e9) + 500_000
+
+    return format_trace_id(trace_id)
+
+
+def database_heavy(session: OtlpSession) -> str:
+    """Many DB CLIENT spans (db_system set) for Database tab."""
+    biz = Biz()
+    service = random.choice(
+        ("demo-orders-service", PRIMARY_SERVICE, "demo-auth-service")
+    )
+    tracer = session.tracer(service, pick_instance_id(service))
+    txn = pick_transaction()
+    age = _age_ns()
+    root_start = time.time_ns() - age
+    n_db = random.randint(2, 5)
+    ops = [pick_db_op() for _ in range(n_db)]
+    total_ms = sum(random.uniform(*o.latency_ms) for o in ops) + 10
+    root_duration_ns = _duration_ns(total_ms, total_ms + 30)
+    span_kind, root_attrs = _root_txn_attrs(txn, biz, status_code=200)
+
+    with _timed_span(
+        tracer,
+        txn.name,
+        kind=span_kind,
+        attributes=root_attrs,
+        start_ns=root_start,
+        duration_ns=root_duration_ns,
+    ) as root:
+        trace_id = root.get_span_context().trace_id
+        parent = session.parent_context(trace_id, root.get_span_context().span_id)
+        t = root_start + 1_000_000
+        for op in ops:
+            d = _emit_db_client(
+                session, tracer=tracer, parent_ctx=parent, op=op, biz=biz, start_ns=t
+            )
+            t += int(d * 1e9) + 300_000
+
+    if txn.kind == "http":
+        session.record_http_server(
+            service_name=service,
+            duration_s=root_duration_ns / 1e9,
+            method=txn.http_method or "GET",
+            route=txn.http_route or "/",
+            status_code=200,
+        )
+    return format_trace_id(trace_id)
+
+
+def no_db_schema_service_trace(session: OtlpSession) -> str:
+    """Service that never emits db_system — External-only outbound.
+
+    Peers may have DB-sounding names but empty db_system (overlap / soft-fail tests).
+    """
+    biz = Biz()
+    tracer = session.tracer(NO_DB_SCHEMA_SERVICE, pick_instance_id(NO_DB_SCHEMA_SERVICE))
+    txn = pick_transaction()
+    age = _age_ns()
+    root_start = time.time_ns() - age
+    root_duration_ns = _duration_ns(40, 120)
+
+    # Fake "db-looking" external peers without db_system
+    fake_db_peers = [
+        PeerSpec(
+            name="postgres-lookalike",
+            kind="http",
+            host="postgres-lookalike.demo.internal",
+            port=8080,
+            weight=10,
+            latency_ms=(10.0, 40.0),
+            peer_service="postgres-lookalike",
+            net_peer_name="postgres-lookalike.demo.internal",
+            route="/query",
+        ),
+        PeerSpec(
+            name="redis-proxy",
+            kind="http",
+            host="redis-proxy.demo.internal",
+            port=8080,
+            weight=10,
+            latency_ms=(5.0, 20.0),
+            peer_service="redis-proxy",
+            net_peer_name="redis-proxy.demo.internal",
+            route="/cache",
+        ),
+        pick_peer(),
+    ]
+    span_kind, root_attrs = _root_txn_attrs(txn, biz, status_code=200)
+
+    with _timed_span(
+        tracer,
+        txn.name,
+        kind=span_kind,
+        attributes=root_attrs,
+        start_ns=root_start,
+        duration_ns=root_duration_ns,
+    ) as root:
+        trace_id = root.get_span_context().trace_id
+        parent = session.parent_context(trace_id, root.get_span_context().span_id)
+        t = root_start + 1_000_000
+        for peer in fake_db_peers:
+            if peer.kind == "nameless":
+                continue
+            d = _emit_external_client(
+                session, tracer=tracer, parent_ctx=parent, peer=peer, biz=biz, start_ns=t
+            )
+            t += int(d * 1e9) + 400_000
+
+    return format_trace_id(trace_id)
+
+
+def empty_external_service(session: OtlpSession) -> str:
+    """SERVER/CONSUMER-only service — External tab should be empty for this service."""
+    biz = Biz()
+    tracer = session.tracer(
+        EMPTY_EXTERNAL_SERVICE, pick_instance_id(EMPTY_EXTERNAL_SERVICE)
+    )
+    txn = pick_transaction()
+    age = _age_ns()
+    root_start = time.time_ns() - age
+    root_duration_ns = _duration_ns(5, 25)
+    span_kind, root_attrs = _root_txn_attrs(txn, biz, status_code=200)
+
+    with _timed_span(
+        tracer,
+        txn.name,
+        kind=span_kind,
+        attributes=root_attrs,
+        start_ns=root_start,
+        duration_ns=root_duration_ns,
+    ) as root:
+        # INTERNAL only — must not pollute External
+        parent = session.parent_context(
+            root.get_span_context().trace_id, root.get_span_context().span_id
+        )
+        with _timed_span(
+            tracer,
+            "render_template",
+            kind=SpanKind.INTERNAL,
+            attributes=biz.span_attrs(),
+            start_ns=root_start + 1_000_000,
+            duration_ns=_duration_ns(1, 8),
+            parent_ctx=parent,
+        ):
+            pass
+        trace_id = root.get_span_context().trace_id
+
+    if txn.kind == "http":
+        session.record_http_server(
+            service_name=EMPTY_EXTERNAL_SERVICE,
+            duration_s=root_duration_ns / 1e9,
+            method=txn.http_method or "GET",
+            route=txn.http_route or "/static/{path}",
+            status_code=200,
+        )
+    return format_trace_id(trace_id)
+
+
+def gateway_mixed(session: OtlpSession) -> str:
+    """Secondary traffic on demo-api-gateway for Overview multi-service view."""
+    biz = Biz()
+    service = "demo-api-gateway"
+    tracer = session.tracer(service, pick_instance_id(service))
+    txn = pick_transaction()
+    age = _age_ns()
+    root_start = time.time_ns() - age
+    peer = pick_entity_type_peer()
+    root_duration_ns = _duration_ns(30, 120)
+    span_kind, root_attrs = _root_txn_attrs(txn, biz, status_code=200)
+
+    with _timed_span(
+        tracer,
+        txn.name,
+        kind=span_kind,
+        attributes=root_attrs,
+        start_ns=root_start,
+        duration_ns=root_duration_ns,
+    ) as root:
+        trace_id = root.get_span_context().trace_id
+        parent = session.parent_context(trace_id, root.get_span_context().span_id)
+        if peer.kind != "nameless":
+            _emit_external_client(
+                session,
+                tracer=tracer,
+                parent_ctx=parent,
+                peer=peer,
+                biz=biz,
+                start_ns=root_start + 2_000_000,
+            )
+        if random.random() < 0.5:
+            _emit_db_client(
+                session,
+                tracer=tracer,
+                parent_ctx=parent,
+                op=pick_db_op(),
+                biz=biz,
+                start_ns=root_start + 10_000_000,
+            )
+
+    return format_trace_id(trace_id)
+
+
+def kafka_worker(session: OtlpSession) -> str:
+    biz = Biz()
+    service = "demo-notification-worker"
+    tracer = session.tracer(service, pick_instance_id(service))
+    age = _age_ns()
+    root_start = time.time_ns() - age
+    root_duration_ns = _duration_ns(40, 150)
+    kafka_peers = [p for p in catalog.PEERS if p.kind == "kafka"]
+    sqs_peers = [p for p in catalog.PEERS if p.kind == "sqs"]
+    sns_peers = [p for p in catalog.PEERS if p.kind == "sns"]
+
+    with _timed_span(
+        tracer,
         "process orders.completed",
         kind=SpanKind.CONSUMER,
         attributes=_merge(
@@ -891,341 +1209,50 @@ def kafka_order_fulfilled(session: OtlpSession) -> str:
                 system="kafka",
                 destination="orders.completed",
                 operation="process",
-                destination_kind="topic",
             ),
-            attrs.code_location(namespace="notify.worker", function="handle_order_completed"),
-            biz.span_attrs({"messaging.kafka.partition": random.randint(0, 11)}),
+            biz.span_attrs(),
         ),
-    ) as consumer:
-        trace_id = consumer.get_span_context().trace_id
-        consumer_span_id = consumer.get_span_context().span_id
-
-        pg_ctx = session.parent_context(trace_id, consumer_span_id)
-        with worker_tracer.start_as_current_span(
-            "SELECT orders",
-            context=pg_ctx,
-            kind=SpanKind.CLIENT,
-            attributes=_merge(
-                attrs.db_client(
-                    system="postgresql",
-                    operation="SELECT",
-                    db_name="orders_db",
-                    sql_table="orders",
-                    statement="SELECT id, email, amount_cents FROM orders WHERE id = $1",
-                    peer="postgresql-orders.demo.internal",
-                    rows_affected=1,
-                ),
-                biz.span_attrs(),
-            ),
-        ):
-            total_duration += _sleep_ms(4, 16)
-
-        s3_ctx = session.parent_context(trace_id, consumer_span_id)
-        s3_duration = _sleep_ms(10, 35)
-        with worker_tracer.start_as_current_span(
-            "PUT s3.PutObject",
-            context=s3_ctx,
-            kind=SpanKind.CLIENT,
-            attributes=_merge(
-                attrs.s3_client(
-                    operation="PutObject",
-                    bucket="demo-order-receipts",
-                    key=receipt_key,
-                    region=biz.region,
-                ),
-                biz.span_attrs(),
-            ),
-        ):
-            pass
-        session.record_http_client(
-            service_name="demo-notification-worker",
-            duration_s=s3_duration,
-            method="PUT",
-            url=f"https://demo-order-receipts.s3.{biz.region}.amazonaws.com/{receipt_key}",
-            status_code=200,
+        start_ns=root_start,
+        duration_ns=root_duration_ns,
+    ) as root:
+        trace_id = root.get_span_context().trace_id
+        parent = session.parent_context(trace_id, root.get_span_context().span_id)
+        t = root_start + 2_000_000
+        _emit_db_client(
+            session, tracer=tracer, parent_ctx=parent, op=pick_db_op(), biz=biz, start_ns=t
         )
-        total_duration += s3_duration
-
-        twilio_ctx = session.parent_context(trace_id, consumer_span_id)
-        twilio_url = "https://api.twilio.com/2010-04-01/Accounts/ACdemo/Messages.json"
-        twilio_duration = _sleep_ms(15, 45)
-        with worker_tracer.start_as_current_span(
-            "POST twilio.messages",
-            context=twilio_ctx,
-            kind=SpanKind.CLIENT,
-            attributes=_merge(
-                attrs.http_client(
-                    method="POST",
-                    url=twilio_url,
-                    status_code=201,
-                    peer="api.twilio.com",
-                    port=443,
-                    peer_service="twilio",
-                    user_agent="twilio-python/8.10.0",
-                ),
-                biz.span_attrs({"twilio.sid": "SM" + biz.order_id[4:]}),
-            ),
-        ):
-            pass
-        session.record_http_client(
-            service_name="demo-notification-worker",
-            duration_s=twilio_duration,
-            method="POST",
-            url=twilio_url,
-            status_code=201,
-        )
-        total_duration += twilio_duration
-
-        producer_ctx = session.parent_context(trace_id, consumer_span_id)
-        with worker_tracer.start_as_current_span(
-            "publish email.send",
-            context=producer_ctx,
-            kind=SpanKind.PRODUCER,
-            attributes=_merge(
-                attrs.messaging(
-                    system="kafka",
-                    destination="email.send",
-                    operation="publish",
-                    destination_kind="topic",
-                ),
-                biz.span_attrs(),
-            ),
-        ):
-            total_duration += _sleep_ms(3, 12)
-
-        sqs_ctx = session.parent_context(trace_id, consumer_span_id)
-        with worker_tracer.start_as_current_span(
-            "send fulfillment.jobs",
-            context=sqs_ctx,
-            kind=SpanKind.PRODUCER,
-            attributes=_merge(
-                attrs.messaging(
-                    system="sqs",
-                    destination="fulfillment-jobs",
-                    operation="publish",
-                    destination_kind="queue",
-                    region=biz.region,
-                ),
-                biz.span_attrs(),
-            ),
-        ):
-            total_duration += _sleep_ms(4, 14)
-
-        total_duration += _sleep_ms(10, 28)
+        for pool in (kafka_peers, sqs_peers, sns_peers):
+            if pool:
+                t += 15_000_000
+                _emit_external_client(
+                    session,
+                    tracer=tracer,
+                    parent_ctx=parent,
+                    peer=pool[-1],
+                    biz=biz,
+                    start_ns=t,
+                )
 
     session.record_messaging_process(
-        service_name="demo-notification-worker",
-        duration_s=total_duration,
+        service_name=service,
+        duration_s=root_duration_ns / 1e9,
         system="kafka",
         destination="orders.completed",
     )
     return format_trace_id(trace_id)
 
 
-def grpc_inventory_check(session: OtlpSession) -> str:
-    biz = Biz()
-    gateway_tracer = session.tracer("demo-api-gateway")
-    inventory_tracer = session.tracer("demo-inventory-service")
-    total_duration = 0.0
-
-    with gateway_tracer.start_as_current_span(
-        "GET /api/v1/products/{id}",
-        kind=SpanKind.SERVER,
-        attributes=_merge(
-            attrs.http_server(
-                method="GET",
-                route="/api/v1/products/{id}",
-                status_code=200,
-                target=f"/api/v1/products/{biz.sku}",
-                user_agent=biz.user_agent,
-                client_ip=biz.client_ip,
-            ),
-            biz.span_attrs(),
-        ),
-    ) as root:
-        trace_id = root.get_span_context().trace_id
-        root_span_id = root.get_span_context().span_id
-
-        redis_ctx = session.parent_context(trace_id, root_span_id)
-        with gateway_tracer.start_as_current_span(
-            "GET inventory_cache",
-            context=redis_ctx,
-            kind=SpanKind.CLIENT,
-            attributes=_merge(
-                attrs.redis_client(
-                    operation="GET",
-                    statement=f"GET inv:{biz.sku}",
-                    namespace="inventory",
-                    peer="redis-inventory.demo.internal",
-                    cache_hit=False,
-                ),
-                biz.span_attrs(),
-            ),
-        ):
-            total_duration += _sleep_ms(2, 9)
-
-        inv_ctx = session.parent_context(trace_id, root_span_id)
-        grpc_duration = _sleep_ms(8, 32)
-        with inventory_tracer.start_as_current_span(
-            "inventory.InventoryService/CheckStock",
-            context=inv_ctx,
-            kind=SpanKind.CLIENT,
-            attributes=_merge(
-                attrs.rpc_client(
-                    system="grpc",
-                    service="inventory.InventoryService",
-                    method="CheckStock",
-                    peer="inventory.demo.internal",
-                    port=50051,
-                    grpc_status=0,
-                ),
-                attrs.code_location(
-                    namespace="inventory.grpc", function="CheckStock"
-                ),
-                biz.span_attrs({"rpc.grpc.status_message": "OK"}),
-            ),
-        ):
-            pass
-        session.record_http_client(
-            service_name="demo-inventory-service",
-            duration_s=grpc_duration,
-            method="POST",
-            url=f"grpc://inventory.demo.internal:50051/CheckStock/{biz.sku}",
-            status_code=200,
-        )
-        total_duration += grpc_duration
-
-        pg_ctx = session.parent_context(trace_id, root_span_id)
-        with inventory_tracer.start_as_current_span(
-            "SELECT inventory",
-            context=pg_ctx,
-            kind=SpanKind.CLIENT,
-            attributes=_merge(
-                attrs.db_client(
-                    system="postgresql",
-                    operation="SELECT",
-                    db_name="inventory_db",
-                    sql_table="inventory",
-                    statement="SELECT sku, on_hand, reserved FROM inventory WHERE sku = $1",
-                    peer="postgresql-inventory.demo.internal",
-                    user="inventory_app",
-                    rows_affected=1,
-                ),
-                biz.span_attrs(),
-            ),
-        ):
-            total_duration += _sleep_ms(4, 16)
-
-        total_duration += _sleep_ms(6, 18)
-
-    session.record_http_server(
-        service_name="demo-api-gateway",
-        duration_s=total_duration,
-        method="GET",
-        route="/api/v1/products/{id}",
-        status_code=200,
-    )
-    return format_trace_id(trace_id)
-
-
-def aws_session_lookup(session: OtlpSession) -> str:
-    """DynamoDB + SQS external AWS services under an auth transaction."""
-    biz = Biz()
-    auth_tracer = session.tracer("demo-auth-service")
-    total_duration = 0.0
-
-    with auth_tracer.start_as_current_span(
-        "POST /auth/session/refresh",
-        kind=SpanKind.SERVER,
-        attributes=_merge(
-            attrs.http_server(
-                method="POST",
-                route="/auth/session/refresh",
-                status_code=200,
-                host="auth.demo.shop",
-                user_agent=biz.user_agent,
-                client_ip=biz.client_ip,
-            ),
-            biz.span_attrs(),
-        ),
-    ) as root:
-        trace_id = root.get_span_context().trace_id
-        root_span_id = root.get_span_context().span_id
-
-        ddb_ctx = session.parent_context(trace_id, root_span_id)
-        with auth_tracer.start_as_current_span(
-            "Query sessions",
-            context=ddb_ctx,
-            kind=SpanKind.CLIENT,
-            attributes=_merge(
-                attrs.dynamodb_client(
-                    operation="Query",
-                    table="demo-sessions",
-                    region=biz.region,
-                    count=1,
-                    scanned_count=1,
-                    statement="Query demo-sessions WHERE pk = :session_id",
-                ),
-                biz.span_attrs(),
-            ),
-        ):
-            total_duration += _sleep_ms(8, 28)
-
-        total_duration += _sleep_ms(6, 16)
-
-    session.record_http_server(
-        service_name="demo-auth-service",
-        duration_s=total_duration,
-        method="POST",
-        route="/auth/session/refresh",
-        status_code=200,
-    )
-    return format_trace_id(trace_id)
-
-
-def high_cardinality_attributes(session: OtlpSession) -> str:
-    biz = Biz()
-    gateway_tracer = session.tracer("demo-api-gateway")
-    total_duration = 0.0
-
-    with gateway_tracer.start_as_current_span(
-        "GET /api/v1/search",
-        kind=SpanKind.SERVER,
-        attributes=_merge(
-            attrs.http_server(
-                method="GET",
-                route="/api/v1/search",
-                status_code=200,
-                user_agent=biz.user_agent,
-                client_ip=biz.client_ip,
-            ),
-            biz.span_attrs(),
-        ),
-    ) as root:
-        trace_id = root.get_span_context().trace_id
-        total_duration += _sleep_ms(12, 40)
-
-    session.record_http_server(
-        service_name="demo-api-gateway",
-        duration_s=total_duration,
-        method="GET",
-        route="/api/v1/search",
-        status_code=200,
-    )
-    return format_trace_id(trace_id)
-
-
 SCENARIOS: list[tuple[ScenarioFn, int]] = [
-    (checkout_happy_path, 26),
-    (checkout_payment_failure, 10),
-    (checkout_client_error, 6),
-    (auth_slow_trace, 10),
-    (search_mixed_db, 16),
-    (db_error_query, 6),
-    (kafka_order_fulfilled, 10),
-    (grpc_inventory_check, 8),
-    (aws_session_lookup, 5),
-    (high_cardinality_attributes, 3),
+    (entity_type_demo, 30),
+    (checkout_external_heavy, 28),
+    (dual_type_peer_trace, 14),
+    (protocol_showcase, 6),
+    (peer_naming_edges, 3),
+    (database_heavy, 10),
+    (no_db_schema_service_trace, 3),
+    (empty_external_service, 2),
+    (gateway_mixed, 2),
+    (kafka_worker, 2),
 ]
 
 
@@ -1235,5 +1262,4 @@ def pick_scenario() -> ScenarioFn:
 
 
 def emit_random(session: OtlpSession) -> str:
-    scenario = pick_scenario()
-    return scenario(session)
+    return pick_scenario()(session)

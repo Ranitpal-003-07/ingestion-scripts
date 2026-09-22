@@ -9,33 +9,22 @@ Environment:
   OTEL_EXPORTER_OTLP_ENDPOINT  NR default or CtrlB base (.../engine/api/default)
   OTEL_EXPORTER_OTLP_HEADERS   Optional extra headers
   TRACES_PER_SECOND       Traces per second (default: 5, max: 100)
+  TIME_SPREAD_MINUTES     Backdate spans across this window (default: 45)
   DEPLOYMENT_ENV          deployment.environment (default: demo)
   OTLP_DISABLE_METRICS    Default on for CtrlB; set 0 to enable metrics export
 
+Coverage (see nr_traces/catalog.py):
+  - 520+ transaction routes, external peers, DB ops, instance IDs / service
+  - demo-checkout: busy External tab (HTTP/gRPC/Kafka, dual-type peers, errors)
+  - DB clients always set db_system; External clients leave it empty
+  - demo-static-cdn: SERVER-only (empty External)
+  - demo-edge-bff: outbound without db_system (External-only / overlap tests)
+
 Usage:
   pip install -r requirements.txt
-  # New Relic
-  export NEW_RELIC_LICENSE_KEY="..."
-  python ingest_traces.py --once
-
-  # CtrlB (no Authorization required; stream via header)
   export OTEL_EXPORTER_OTLP_ENDPOINT="https://staging.ctrlb.dev/engine/api/default"
-  export STREAM_NAME="your_traces_stream"
-  python3 ingest_traces.py --rate 5
-
-CtrlB SQL smoke checks (replace <stream>):
-  SELECT span_kind, COUNT(*) FROM "<stream>" GROUP BY span_kind ORDER BY 2 DESC;
-  SELECT span_status, COUNT(*) FROM "<stream>" GROUP BY span_status;
-  SELECT service_name, operation_name, COUNT(*) FROM "<stream>"
-    WHERE span_kind = '2' OR span_kind = 'SPAN_KIND_SERVER'
-    GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 20;
-  SELECT COALESCE(NULLIF(db_system_name,''), db_system) AS sys,
-         COALESCE(NULLIF(db_operation_name,''), db_operation) AS op,
-         COALESCE(NULLIF(db_sql_table,''), NULLIF(db_mongodb_collection,''),
-                  NULLIF(db_namespace,''), db_name) AS target,
-         COUNT(*) FROM "<stream>"
-    WHERE span_kind = '3' OR span_kind = 'SPAN_KIND_CLIENT'
-    GROUP BY 1, 2, 3 ORDER BY 4 DESC LIMIT 20;
+  export STREAM_NAME="traces_testing_sep"
+  python3 ingest_traces.py --rate 30 --spread 45
 """
 
 from __future__ import annotations
@@ -74,9 +63,10 @@ def run_once(session: OtlpSession) -> None:
 
 def run_loop(session: OtlpSession) -> None:
     logger.info(
-        "Starting OTLP trace ingestion to %s (%s traces/sec, env=%s, stream=%s)",
+        "Starting OTLP trace ingestion to %s (%s traces/sec, spread=%sm, env=%s, stream=%s)",
         config.resolve_traces_endpoint(),
         config.TRACES_PER_SECOND,
+        config.TIME_SPREAD_MINUTES,
         config.DEPLOYMENT_ENV,
         config.STREAM_NAME or "-",
     )
@@ -131,6 +121,16 @@ def main() -> int:
         help=f"Traces per second (default {config.DEFAULT_TRACES_PER_SECOND}, max {config.MAX_TRACES_PER_SECOND})",
     )
     parser.add_argument(
+        "--spread",
+        type=int,
+        default=None,
+        metavar="MINUTES",
+        help=(
+            "Backdate span timestamps across the last N minutes "
+            f"(default {config.DEFAULT_TIME_SPREAD_MINUTES}; 0 = now only)"
+        ),
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -145,6 +145,7 @@ def main() -> int:
 
     config.validate_config()
     config.configure_traces_per_second(args.rate)
+    config.configure_time_spread_minutes(args.spread)
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)

@@ -415,14 +415,22 @@ def rpc_client(
     method: str,
     peer: str,
     port: int = 50051,
-    grpc_status: int = 0,
+    grpc_status: int | None = None,
+    peer_service: str | None = None,
 ) -> dict[str, Any]:
     peer_ip = ids.random_ip()
-    return {
+    transport = "ip_tcp"
+    protocol_version = system
+    if system == "grpc":
+        protocol_version = "grpc"
+        if grpc_status is None:
+            grpc_status = 0
+    elif system == "connect_rpc":
+        protocol_version = "connect"
+    payload: dict[str, Any] = {
         "rpc.system": system,
         "rpc.service": service,
         "rpc.method": method,
-        "rpc.grpc.status_code": grpc_status,
         "server.address": peer,
         "server.port": port,
         "net.peer.name": peer,
@@ -430,14 +438,113 @@ def rpc_client(
         "net.peer.ip": peer_ip,
         "net.sock.peer.addr": peer_ip,
         "net.sock.peer.port": port,
-        "net.transport": "ip_tcp",
+        "net.transport": transport,
         "network.peer.address": peer_ip,
         "network.peer.port": port,
         "network.transport": "tcp",
-        "network.protocol.version": "grpc",
+        "network.protocol.version": protocol_version,
         "network.type": "ipv4",
-        "peer.service": service,
+        "peer.service": peer_service
+        or (service.rsplit(".", 1)[0] if "." in service else service),
     }
+    if system == "grpc" and grpc_status is not None:
+        payload["rpc.grpc.status_code"] = grpc_status
+    return _omit_none(payload)
+
+
+def graphql_client(
+    *,
+    url: str,
+    operation_name: str,
+    operation_type: str = "query",
+    status_code: int = 200,
+    peer_service: str | None = None,
+) -> dict[str, Any]:
+    attrs = http_client(
+        method="POST",
+        url=url,
+        status_code=status_code,
+        peer_service=peer_service,
+        flavor="2.0",
+        user_agent="graphql-client/3.0",
+    )
+    attrs.update(
+        {
+            "graphql.operation.name": operation_name,
+            "graphql.operation.type": operation_type,
+            "graphql.document": f"{operation_type} {operation_name} {{ ... }}",
+            "rpc.system": "graphql",
+            "rpc.service": "GraphQL",
+            "rpc.method": operation_name,
+        }
+    )
+    return attrs
+
+
+def websocket_client(
+    *,
+    url: str,
+    peer_service: str | None = None,
+    message_type: str = "text",
+) -> dict[str, Any]:
+    parsed = urlparse(url)
+    peer = parsed.hostname or "ws.demo.internal"
+    port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+    peer_ip = ids.random_ip()
+    return _omit_none(
+        {
+            "peer.service": peer_service or peer,
+            "server.address": peer,
+            "server.port": port,
+            "net.peer.name": peer,
+            "net.peer.port": port,
+            "net.peer.ip": peer_ip,
+            "net.transport": "ip_tcp",
+            "network.transport": "tcp",
+            "network.protocol.version": "13",
+            "network.type": "ipv4",
+            "url.full": url,
+            "url.scheme": parsed.scheme or "wss",
+            "http.request.method": "GET",
+            "http.method": "GET",
+            "http.response.status_code": 101,
+            "http.status_code": 101,
+            "http.flavor": "1.1",
+            "messaging.system": "websocket",
+            "messaging.operation": "publish",
+            "messaging.destination": parsed.path or "/ws",
+            "messaging.destination.name": parsed.path or "/ws",
+            "messaging.message.id": ids.random_message_id(),
+            "websocket.message.type": message_type,
+        }
+    )
+
+
+def soap_client(
+    *,
+    url: str,
+    action: str,
+    status_code: int = 200,
+    peer_service: str | None = None,
+) -> dict[str, Any]:
+    attrs = http_client(
+        method="POST",
+        url=url,
+        status_code=status_code,
+        peer_service=peer_service,
+        flavor="1.1",
+        user_agent="SOAP-Client/1.0",
+    )
+    attrs.update(
+        {
+            "rpc.system": "soap",
+            "rpc.service": "SOAP",
+            "rpc.method": action,
+            "http.request.header.soapaction": f'"{action}"',
+            "http.request.header.content_type": "text/xml; charset=utf-8",
+        }
+    )
+    return attrs
 
 
 def messaging(
@@ -449,15 +556,39 @@ def messaging(
     message_id: str | None = None,
     url: str | None = None,
     region: str | None = None,
+    peer_service: str | None = None,
+    peer_host: str | None = None,
+    peer_port: int | None = None,
 ) -> dict[str, Any]:
     message_id = message_id or ids.random_message_id()
-    if system == "kafka":
-        url = url or f"kafka://kafka-orders.demo.internal:9092/{destination}"
-    elif system == "sqs":
-        url = url or (
-            f"https://sqs.{region or 'us-east-1'}.amazonaws.com/123456789012/{destination}"
-        )
-    payload = {
+    defaults = {
+        "kafka": (f"kafka://kafka.demo.internal:9092/{destination}", 9092, "topic"),
+        "rabbitmq": (f"amqp://rabbitmq.demo.internal:5672/{destination}", 5672, "queue"),
+        "sqs": (
+            f"https://sqs.{region or 'us-east-1'}.amazonaws.com/123456789012/{destination}",
+            443,
+            "queue",
+        ),
+        "sns": (
+            f"arn:aws:sns:{region or 'us-east-1'}:123456789012:{destination}",
+            443,
+            "topic",
+        ),
+        "nats": (f"nats://nats.demo.internal:4222/{destination}", 4222, "topic"),
+        "mqtt": (f"mqtt://mqtt.demo.internal:1883/{destination}", 1883, "topic"),
+        "pulsar": (f"pulsar://pulsar.demo.internal:6650/{destination}", 6650, "topic"),
+        "websocket": (destination, 443, "topic"),
+    }
+    default_url, default_port, default_kind = defaults.get(
+        system, (f"{system}://{system}.demo.internal/{destination}", 8080, destination_kind)
+    )
+    url = url or default_url
+    destination_kind = destination_kind or default_kind
+    peer_host = peer_host or urlparse(url).hostname or f"{system}.demo.internal"
+    peer_port = peer_port if peer_port is not None else default_port
+    peer_ip = ids.random_ip()
+
+    payload: dict[str, Any] = {
         "messaging.system": system,
         "messaging.destination": destination,
         "messaging.destination.name": destination,
@@ -465,7 +596,18 @@ def messaging(
         "messaging.operation": operation,
         "messaging.message.id": message_id,
         "messaging.url": url,
-        "peer.service": system,
+        "peer.service": peer_service or system,
+        "server.address": peer_host,
+        "server.port": peer_port,
+        "net.peer.name": peer_host,
+        "net.peer.port": peer_port,
+        "net.peer.ip": peer_ip,
+        "net.sock.peer.addr": peer_ip,
+        "net.transport": "ip_tcp",
+        "network.peer.address": peer_ip,
+        "network.peer.port": peer_port,
+        "network.transport": "tcp",
+        "network.type": "ipv4",
     }
     if system == "sqs":
         payload["aws.sqs.queue.url"] = url
@@ -473,4 +615,55 @@ def messaging(
         payload["aws.region"] = region or "us-east-1"
         payload["aws.request_id"] = ids.random_aws_request_id()
         payload["sqs.handler"] = "OrderFulfilledHandler"
+    elif system == "sns":
+        payload["aws.sns.topic.arn"] = url
+        payload["aws.region"] = region or "us-east-1"
+        payload["aws.request_id"] = ids.random_aws_request_id()
+    elif system == "kafka":
+        payload["messaging.kafka.partition"] = random.randint(0, 11)
+        payload["messaging.kafka.message.offset"] = random.randint(1000, 999999)
+    elif system == "rabbitmq":
+        payload["messaging.rabbitmq.routing_key"] = destination
+        payload["messaging.rabbitmq.delivery_tag"] = random.randint(1, 50000)
+    elif system == "mqtt":
+        payload["messaging.mqtt.qos"] = random.choice((0, 1, 2))
     return _omit_none(payload)
+
+
+def aws_api_client(
+    *,
+    service: str,
+    operation: str,
+    region: str,
+    peer_service: str | None = None,
+    status_code: int = 200,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    host = f"{service}.{region}.amazonaws.com"
+    url = f"https://{host}/"
+    attrs = http_client(
+        method="POST",
+        url=url,
+        status_code=status_code,
+        peer=host,
+        port=443,
+        peer_service=peer_service or f"aws.{service}",
+        user_agent="aws-sdk-python/1.34.0",
+        flavor="1.1",
+    )
+    attrs.update(
+        {
+            "rpc.system": "aws-api",
+            "rpc.service": service.upper() if len(service) <= 4 else service,
+            "rpc.method": operation,
+            "aws.region": region,
+            "aws.request_id": ids.random_aws_request_id(),
+            "faas.invoked_provider": "aws",
+            "faas.invoked_region": region,
+            "faas.invoked_name": service,
+        }
+    )
+    if extra:
+        attrs.update(extra)
+    return attrs
+

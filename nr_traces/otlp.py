@@ -1,9 +1,10 @@
-"""OTLP exporters and per-service tracers for New Relic/CtrlB/custom backends."""
+"""OTLP exporters and lazy per-(service, instance) tracers."""
 
 from __future__ import annotations
 
 import logging
 import os
+import random
 from typing import TYPE_CHECKING
 
 from opentelemetry import metrics, trace
@@ -16,7 +17,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
 
-from nr_traces import config
+from nr_traces import catalog, config
 
 if TYPE_CHECKING:
     from opentelemetry.context import Context
@@ -42,7 +43,7 @@ class _SharedSpanExporter:
 
 
 class OtlpSession:
-    """Manages OTLP trace/metric export for all demo services."""
+    """Manages OTLP trace/metric export with high instance.id cardinality."""
 
     def __init__(self) -> None:
         headers = config.build_otlp_headers()
@@ -53,22 +54,22 @@ class OtlpSession:
         traces_endpoint = config.resolve_traces_endpoint()
         metrics_endpoint = config.resolve_metrics_endpoint()
         logger.info(
-            "OTLP traces endpoint=%s headers=%s",
+            "OTLP traces endpoint=%s headers=%s services=%s instances/service=%s",
             traces_endpoint,
             {
                 k: ("***" if k.lower() in ("authorization", "api-key") else v)
                 for k, v in headers.items()
             },
+            len(config.SERVICES),
+            catalog.ENTITY_COUNT,
         )
 
-        # One shared exporter — 6 parallel exporters caused CtrlB 502s under load.
-        # Enriched spans are larger; give CtrlB more than the 10s default.
         self._span_exporter = OTLPSpanExporter(
             endpoint=traces_endpoint,
             headers=headers,
             timeout=30,
         )
-        shared = _SharedSpanExporter(self._span_exporter)
+        self._shared = _SharedSpanExporter(self._span_exporter)
         self._metric_exporter: OTLPMetricExporter | None = None
         if not config.OTLP_DISABLE_METRICS:
             self._metric_exporter = OTLPMetricExporter(
@@ -76,57 +77,20 @@ class OtlpSession:
                 headers=headers,
             )
 
-        # Gentler flush for CtrlB gateways; NR can tolerate tighter batches.
         if config.is_ctrlb_backend():
-            schedule_delay_millis = 2000
-            max_export_batch_size = 64
+            self._schedule_delay_millis = 2000
+            self._max_export_batch_size = 64
         else:
-            schedule_delay_millis = 500
-            max_export_batch_size = 512
+            self._schedule_delay_millis = 500
+            self._max_export_batch_size = 512
 
+        # Lazy: (service_name, instance_id) → Tracer. Shared exporter avoids 502s.
         self._tracer_providers: list[TracerProvider] = []
-        self._tracers: dict[str, Tracer] = {}
-
-        for service_name in config.SERVICES:
-            meta = config.SERVICE_META.get(service_name, {})
-            resource = Resource.create(
-                {
-                    "service.name": service_name,
-                    "service.version": str(meta.get("version", "1.0.0")),
-                    "service.instance.id": f"{service_name}-{config.SERVICE_INSTANCE_ID[:8]}",
-                    "deployment.environment": config.DEPLOYMENT_ENV,
-                    "host.name": str(meta.get("host.name", f"{service_name}-1")),
-                    "host.arch": "amd64",
-                    "os.type": "linux",
-                    "os.description": "Ubuntu 22.04.4 LTS",
-                    "os.version": "5.15.0-105-generic",
-                    "process.pid": int(meta.get("process.pid", 15000)),
-                    "process.runtime.name": "cpython",
-                    "process.runtime.version": "3.10.12",
-                    "process.runtime.description": "CPython 3.10.12",
-                    "process.command_line": f"gunicorn {service_name}.wsgi:app",
-                    "process.executable.path": "/usr/local/bin/python3.10",
-                    "container.id": str(meta.get("container.id", service_name)),
-                    "cloud.region": "us-east-1",
-                    "telemetry.distro.name": "opentelemetry",
-                    "telemetry.distro.version": "1.27.0",
-                    "telemetry.auto.version": "0.48b0",
-                }
-            )
-            provider = TracerProvider(resource=resource)
-            provider.add_span_processor(
-                BatchSpanProcessor(
-                    shared,
-                    schedule_delay_millis=schedule_delay_millis,
-                    max_export_batch_size=max_export_batch_size,
-                )
-            )
-            self._tracer_providers.append(provider)
-            self._tracers[service_name] = provider.get_tracer("nr-fake-apm")
+        self._tracers: dict[tuple[str, str], Tracer] = {}
 
         default_resource = Resource.create(
             {
-                "service.name": "demo-api-gateway",
+                "service.name": catalog.PRIMARY_SERVICE,
                 "service.instance.id": config.SERVICE_INSTANCE_ID,
                 "deployment.environment": config.DEPLOYMENT_ENV,
             }
@@ -161,8 +125,60 @@ class OtlpSession:
             description="Duration of messaging consumer processing",
         )
 
-    def tracer(self, service_name: str) -> Tracer:
-        return self._tracers[service_name]
+    def _make_resource(self, service_name: str, instance_id: str) -> Resource:
+        meta = catalog.SERVICE_META.get(service_name, {})
+        host_base = str(meta.get("host.name", f"{service_name}-1"))
+        # Derive a plausible host per instance without exploding uniqueness too far
+        suffix = instance_id.rsplit("-i", 1)[-1]
+        try:
+            n = int(suffix)
+            host = f"ip-10-{(n // 256) % 32}-{(n // 16) % 16}-{n % 250 + 1}"
+        except ValueError:
+            host = host_base
+        return Resource.create(
+            {
+                "service.name": service_name,
+                "service.version": str(meta.get("version", "1.0.0")),
+                "service.instance.id": instance_id,
+                "deployment.environment": config.DEPLOYMENT_ENV,
+                "host.name": host,
+                "host.arch": "amd64",
+                "os.type": "linux",
+                "os.description": "Ubuntu 22.04.4 LTS",
+                "os.version": "5.15.0-105-generic",
+                "process.pid": int(meta.get("process.pid", 15000)) + (hash(instance_id) % 500),
+                "process.runtime.name": "cpython",
+                "process.runtime.version": "3.10.12",
+                "process.runtime.description": "CPython 3.10.12",
+                "process.command_line": f"gunicorn {service_name}.wsgi:app",
+                "process.executable.path": "/usr/local/bin/python3.10",
+                "container.id": f"{meta.get('container.id', service_name)}-{suffix}",
+                "cloud.region": random.choice(("us-east-1", "eu-west-1", "ap-south-1")),
+                "telemetry.distro.name": "opentelemetry",
+                "telemetry.distro.version": "1.27.0",
+                "telemetry.auto.version": "0.48b0",
+            }
+        )
+
+    def tracer(self, service_name: str, instance_id: str | None = None) -> Tracer:
+        instance_id = instance_id or catalog.pick_instance_id(service_name)
+        key = (service_name, instance_id)
+        existing = self._tracers.get(key)
+        if existing is not None:
+            return existing
+
+        provider = TracerProvider(resource=self._make_resource(service_name, instance_id))
+        provider.add_span_processor(
+            BatchSpanProcessor(
+                self._shared,
+                schedule_delay_millis=self._schedule_delay_millis,
+                max_export_batch_size=self._max_export_batch_size,
+            )
+        )
+        self._tracer_providers.append(provider)
+        tracer = provider.get_tracer("nr-fake-apm")
+        self._tracers[key] = tracer
+        return tracer
 
     @staticmethod
     def parent_context(trace_id: int, parent_span_id: int) -> Context:

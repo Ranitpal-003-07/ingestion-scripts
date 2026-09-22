@@ -57,6 +57,13 @@ DEFAULT_TRACES_PER_SECOND = 5
 MAX_TRACES_PER_SECOND = 100
 TRACES_PER_SECOND = DEFAULT_TRACES_PER_SECOND
 
+# Backdate span timestamps uniformly across this window (minutes) for chart buckets.
+DEFAULT_TIME_SPREAD_MINUTES = 45
+TIME_SPREAD_MINUTES = int(
+    _clean_env(os.environ.get("TIME_SPREAD_MINUTES", str(DEFAULT_TIME_SPREAD_MINUTES)))
+    or str(DEFAULT_TIME_SPREAD_MINUTES)
+)
+
 
 def configure_traces_per_second(cli_rate: int | None = None) -> int:
     """Resolve rate from --rate, then TRACES_PER_SECOND env, then default."""
@@ -92,60 +99,16 @@ def configure_traces_per_second(cli_rate: int | None = None) -> int:
     TRACES_PER_SECOND = value
     return value
 
-SERVICES = (
-    "demo-api-gateway",
-    "demo-orders-service",
-    "demo-inventory-service",
-    "demo-payment-service",
-    "demo-notification-worker",
-    "demo-auth-service",
-)
 
-# Resource attributes flatten under service_* in CtrlB (host.name → service_host_name).
-SERVICE_META: dict[str, dict[str, str | int]] = {
-    "demo-api-gateway": {
-        "version": "2.8.1",
-        "host.name": "ip-10-2-11-14",
-        "container.id": "gw-7c9d4f2a1b",
-        "process.pid": 18421,
-        "code.namespace": "gateway.http.checkout",
-    },
-    "demo-orders-service": {
-        "version": "1.19.4",
-        "host.name": "ip-10-2-24-71",
-        "container.id": "ord-3ae19c80d2",
-        "process.pid": 22104,
-        "code.namespace": "orders.api",
-    },
-    "demo-inventory-service": {
-        "version": "1.6.0",
-        "host.name": "ip-10-2-31-8",
-        "container.id": "inv-91bb0e44c7",
-        "process.pid": 19002,
-        "code.namespace": "inventory.grpc",
-    },
-    "demo-payment-service": {
-        "version": "3.2.7",
-        "host.name": "ip-10-2-18-55",
-        "container.id": "pay-55e1aa0193",
-        "process.pid": 17650,
-        "code.namespace": "payments.stripe",
-    },
-    "demo-notification-worker": {
-        "version": "0.14.2",
-        "host.name": "ip-10-2-41-12",
-        "container.id": "ntf-c01d8aa4e6",
-        "process.pid": 24011,
-        "code.namespace": "notify.worker",
-    },
-    "demo-auth-service": {
-        "version": "4.1.0",
-        "host.name": "ip-10-2-9-33",
-        "container.id": "auth-bb2188f091",
-        "process.pid": 15808,
-        "code.namespace": "auth.verify",
-    },
-}
+def configure_time_spread_minutes(cli_minutes: int | None = None) -> int:
+    global TIME_SPREAD_MINUTES
+    if cli_minutes is not None:
+        TIME_SPREAD_MINUTES = max(0, int(cli_minutes))
+    return TIME_SPREAD_MINUTES
+
+
+# Imported from catalog so SERVICES / SERVICE_META stay in one place.
+from nr_traces.catalog import SERVICE_META, SERVICES  # noqa: E402
 
 def _parse_otlp_headers(raw: str) -> dict[str, str]:
     """Parse OTEL_EXPORTER_OTLP_HEADERS: key=value,key2=value2."""

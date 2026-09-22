@@ -2,14 +2,13 @@
 
 ## Overview
 
-Ingests **synthetic OpenTelemetry traces** via OTLP/HTTP for APM query testing.
-Defaults to New Relic; targets **CtrlB** with `STREAM_NAME` (no auth required).
+Ingests **synthetic OpenTelemetry traces** via OTLP/HTTP for APM query testing
+(Transactions / Database / External tabs). Defaults to New Relic; targets
+**CtrlB** with `STREAM_NAME` (no auth required).
 
-Spans are shaped for the CtrlB prod schema (underscore columns): dual HTTP/DB
-semconv attrs (`http_response_status_code` + `http_status_code`,
-`db_system_name` + `db_system`, `db_sql_table` / `db_mongodb_collection` /
-`db_namespace`), NR-default errors (5xx + exceptions, separate 4xx scenario),
-and SERVER/CLIENT kinds for transaction vs DB queries.
+Catalog size (`nr_traces/catalog.py`): **520** transaction routes, external
+peers, DB operations, and instance IDs per service — enough for pagination
+(LIMIT 100), ranks (top 3), and high-cardinality instance filters.
 
 ## Endpoint
 
@@ -24,64 +23,54 @@ Do **not** use the logs-style `/{stream}/_otel/v1/traces` path for spans — tha
 
 ```bash
 cd random
-cp .env.traces.example .env   # set STREAM_NAME
-set -a && source .env && set +a
-pip install -r requirements.txt
-python ingest_traces.py --once
-python ingest_traces.py --rate 5
-```
-
-```bash
 export OTEL_EXPORTER_OTLP_ENDPOINT="https://staging.ctrlb.dev/engine/api/default"
-export STREAM_NAME="your_traces_stream"
-python ingest_traces.py --rate 5
+export STREAM_NAME="traces_testing_sep"
+python3 ingest_traces.py --rate 30 --spread 45
 ```
 
-Metrics are **disabled by default** on CtrlB (`OTLP_DISABLE_METRICS`).
+`--spread 45` backdates span timestamps across the last 45 minutes so stats
+charts have buckets. Metrics are **disabled by default** on CtrlB.
 
-## What gets emitted (query coverage)
+## What gets emitted
 
-| Scenario | Why |
-|----------|-----|
-| `checkout_happy_path` | SERVER txn + postgres CLIENT (`db_sql_table=orders`) + HTTP client |
-| `checkout_payment_failure` | 5xx + `status_code=ERROR` + exception |
-| `checkout_client_error` | 4xx only (should **not** count as NR-default error) |
-| `auth_slow_trace` | Slow SERVER + redis CLIENT (apdex / slowest) |
-| `search_mixed_db` | mysql / mongodb / redis normalized DB keys |
-| `db_error_query` | DB error + `db_response_status_code=500` |
-| `grpc_inventory_check` | `rpc_system` / `rpc_method` / `rpc_grpc_status_code` |
-| `kafka_order_fulfilled` | messaging CONSUMER/PRODUCER |
+| Service | Role |
+|---------|------|
+| `demo-checkout` | Busy primary — External tab end-to-end |
+| `demo-api-gateway` / orders / auth / … | Multi-service Overview |
+| `demo-edge-bff` | Outbound **without** `db_system` (External-only / soft-fail) |
+| `demo-static-cdn` | SERVER + INTERNAL only → **empty External** |
 
-Demo `service.name` values: `demo-api-gateway`, `demo-orders-service`,
-`demo-inventory-service`, `demo-payment-service`, `demo-notification-worker`,
-`demo-auth-service`.
+### External protocols (entity_type coverage)
 
-## CtrlB verification SQL
+Fixed mix for External client spans:
 
-```sql
-SELECT span_kind, COUNT(*) FROM "<stream>" GROUP BY span_kind ORDER BY 2 DESC;
-SELECT span_status, COUNT(*) FROM "<stream>" GROUP BY span_status;
+| entity_type | % | Recipe peer / fields |
+|-------------|---|----------------------|
+| `http` | 40 | `payments` + `http_method=GET`, `http_route=/charge` |
+| `grpc` | 25 | `inventory` / `payments` + `rpc_system=grpc` (no HTTP fields) |
+| `kafka` | 15 | `orders-bus` + `messaging_system=kafka` |
+| `graphql_http` | 10 | `catalog-graphql` + HTTP + `graphql.operation.*` |
+| `other` | 10 | `mystery-peer` (peer_service only) |
 
-SELECT service_name, operation_name, COUNT(*) FROM "<stream>"
-WHERE service_name LIKE 'demo-%'
-  AND (span_kind = '2' OR span_kind = 'SPAN_KIND_SERVER')
-GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 20;
+Dual-type: `payments` as **http** and **grpc** (table two rows). Database spans still set `db_system` and are excluded from External. Kafka/messaging use `span_kind=CLIENT` (3).
 
-SELECT COALESCE(NULLIF(db_system_name,''), db_system) AS sys,
-       COALESCE(NULLIF(db_operation_name,''), db_operation) AS op,
-       COALESCE(NULLIF(db_sql_table,''), NULLIF(db_mongodb_collection,''),
-                NULLIF(db_namespace,''), db_name) AS target,
-       COUNT(*) FROM "<stream>"
-WHERE (span_kind = '3' OR span_kind = 'SPAN_KIND_CLIENT')
-  AND COALESCE(NULLIF(db_system_name,''), db_system, '') != ''
-GROUP BY 1, 2, 3 ORDER BY 4 DESC LIMIT 20;
-```
+
+### Database vs External
+
+- DB clients: `span_kind=CLIENT`, **`db_system` set** (postgres/mysql/mongo/redis/es), often with `peer_service` too → **Database tab**
+- Non-DB clients: **`db_system` empty** + `peer_service` / `net_peer_name` → **External only**
+
+### Transactions / instances
+
+- 520 SERVER `operation_name` routes
+- 520 `service.instance.id` values per service (lazy TracerProviders)
 
 ## Package layout
 
 | Module | Role |
 |--------|------|
+| [`nr_traces/catalog.py`](../nr_traces/catalog.py) | 520-entity catalogs + special peers |
 | [`nr_traces/attrs.py`](../nr_traces/attrs.py) | Schema-aligned attribute builders |
-| [`nr_traces/scenarios.py`](../nr_traces/scenarios.py) | Weighted APM scenarios |
-| [`nr_traces/config.py`](../nr_traces/config.py) | Endpoint / stream / auth |
-| [`nr_traces/otlp.py`](../nr_traces/otlp.py) | OTLP session |
+| [`nr_traces/scenarios.py`](../nr_traces/scenarios.py) | Weighted scenarios + timed spans |
+| [`nr_traces/config.py`](../nr_traces/config.py) | Endpoint / stream / spread |
+| [`nr_traces/otlp.py`](../nr_traces/otlp.py) | Shared exporter + lazy instances |
