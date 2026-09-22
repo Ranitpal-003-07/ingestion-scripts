@@ -25,7 +25,7 @@ PRIMARY_SERVICE = "demo-checkout"
 # SERVER-only — External should be empty.
 EMPTY_EXTERNAL_SERVICE = "demo-static-cdn"
 
-# Emits outbound clients WITHOUT db_system (External only; can look DB-ish by name).
+# Emits DB CLIENT ops WITHOUT db.system (db.statement/operation kept) + DB-ish HTTP peers.
 NO_DB_SCHEMA_SERVICE = "demo-edge-bff"
 
 SERVICES = (

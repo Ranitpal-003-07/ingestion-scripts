@@ -619,7 +619,13 @@ def _emit_db_client(
     op: DbOp,
     biz: Biz,
     start_ns: int,
+    omit_db_system: bool = False,
 ) -> float:
+    """Emit a CLIENT span with DB attributes.
+
+    When omit_db_system=True (demo-edge-bff), keep db.operation / db.statement /
+    peer naming but strip db.system so Database tab soft-fails / External overlap.
+    """
     duration_ns = _duration_ns(*op.latency_ms)
     duration_s = duration_ns / 1e9
     db_attrs: dict[str, Any]
@@ -658,6 +664,10 @@ def _emit_db_client(
         )
     # DB clients also set peer.service (tracer-style) — must still land in Database.
     db_attrs["peer.service"] = op.peer.split(".")[0]
+
+    if omit_db_system:
+        db_attrs.pop("db.system", None)
+        db_attrs.pop("db.system.name", None)
 
     otel_err = random.random() < op.error_rate
     if otel_err:
@@ -1037,17 +1047,20 @@ def database_heavy(session: OtlpSession) -> str:
 
 
 def no_db_schema_service_trace(session: OtlpSession) -> str:
-    """Service that never emits db_system — External-only outbound.
+    """demo-edge-bff: DB ops WITHOUT db.system (+ DB-looking HTTP peers).
 
-    Peers may have DB-sounding names but empty db_system (overlap / soft-fail tests).
+    CLIENT spans still carry db.operation / db.statement / peer.service, but
+    db.system and db.system.name are stripped — Database tab should soft-fail;
+    External may pick them up depending on product rules.
     """
     biz = Biz()
     tracer = session.tracer(NO_DB_SCHEMA_SERVICE, pick_instance_id(NO_DB_SCHEMA_SERVICE))
     txn = pick_transaction()
     age = _age_ns()
     root_start = time.time_ns() - age
-    root_duration_ns = _duration_ns(40, 120)
 
+    # Real DB client shapes, but omit_db_system=True
+    db_ops = [pick_db_op() for _ in range(random.randint(2, 4))]
     # Fake "db-looking" external peers without db_system
     fake_db_peers = [
         PeerSpec(
@@ -1074,19 +1087,35 @@ def no_db_schema_service_trace(session: OtlpSession) -> str:
         ),
         pick_peer(),
     ]
+    total_ms = sum(random.uniform(*o.latency_ms) for o in db_ops) + 20
+    root_duration_ns = _duration_ns(total_ms, total_ms + 40)
     span_kind, root_attrs = _root_txn_attrs(txn, biz, status_code=200)
 
     with _timed_span(
         tracer,
         txn.name,
         kind=span_kind,
-        attributes=root_attrs,
+        attributes=_merge(
+            root_attrs,
+            biz.span_attrs({"scenario": "no_db_system", "db.system.omitted": True}),
+        ),
         start_ns=root_start,
         duration_ns=root_duration_ns,
     ) as root:
         trace_id = root.get_span_context().trace_id
         parent = session.parent_context(trace_id, root.get_span_context().span_id)
         t = root_start + 1_000_000
+        for op in db_ops:
+            d = _emit_db_client(
+                session,
+                tracer=tracer,
+                parent_ctx=parent,
+                op=op,
+                biz=biz,
+                start_ns=t,
+                omit_db_system=True,
+            )
+            t += int(d * 1e9) + 300_000
         for peer in fake_db_peers:
             if peer.kind == "nameless":
                 continue
@@ -1243,13 +1272,13 @@ def kafka_worker(session: OtlpSession) -> str:
 
 
 SCENARIOS: list[tuple[ScenarioFn, int]] = [
-    (entity_type_demo, 30),
-    (checkout_external_heavy, 28),
-    (dual_type_peer_trace, 14),
+    (entity_type_demo, 28),
+    (checkout_external_heavy, 26),
+    (dual_type_peer_trace, 12),
     (protocol_showcase, 6),
     (peer_naming_edges, 3),
     (database_heavy, 10),
-    (no_db_schema_service_trace, 3),
+    (no_db_schema_service_trace, 10),  # demo-edge-bff: DB ops sans db.system
     (empty_external_service, 2),
     (gateway_mixed, 2),
     (kafka_worker, 2),
