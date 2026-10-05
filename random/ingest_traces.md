@@ -24,13 +24,19 @@ Do **not** use the logs-style `/{stream}/_otel/v1/traces` path for spans — tha
 ```bash
 cd random
 export OTEL_EXPORTER_OTLP_ENDPOINT="https://staging.ctrlb.dev/engine/api/default"
-export STREAM_NAME="traces_testing_sep"
+export STREAM_NAME="traces_key_timestamp"
 python3 ingest_traces.py --rate 30 --spread 45
 ```
 
 `--spread 45` backdates span timestamps across the last 45 minutes so stats
 charts have buckets. Metrics are **disabled by default** on CtrlB.
 
+Every span includes custom attributes for CtrlB column tests:
+
+| Attribute | Type | Example |
+|-----------|------|---------|
+| `key` | string | `checkout-a1b2c3d4` |
+| `timestamp` | int (µs since epoch) | `1727600000123456` |
 ## What gets emitted
 
 | Service | Role |

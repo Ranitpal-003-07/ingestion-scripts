@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import random
 import string
+import time
 import uuid
 
 
@@ -28,6 +29,19 @@ USER_AGENTS = (
 CURRENCIES = ("USD", "EUR", "INR", "GBP")
 PAYMENT_METHODS = ("card", "wallet", "netbanking", "upi", "apple_pay")
 HTTP_FLAVORS = ("1.1", "2.0")
+# Facet keys for CtrlB key/timestamp field tests.
+SPAN_KEYS = (
+    "checkout",
+    "inventory",
+    "payments",
+    "orders",
+    "auth",
+    "search",
+    "notify",
+    "gateway",
+    "cdn",
+    "edge",
+)
 
 
 def new_trace_id() -> int:
@@ -101,6 +115,16 @@ def random_az(region: str | None = None) -> str:
 
 def random_tenant() -> str:
     return random.choice(TENANTS)
+
+
+def random_span_key() -> str:
+    """CtrlB facet key — category + short id for cardinality."""
+    return f"{random.choice(SPAN_KEYS)}-{uuid.uuid4().hex[:8]}"
+
+
+def now_timestamp_us() -> int:
+    """Wall-clock microseconds since epoch (CtrlB log-style timestamp)."""
+    return int(time.time() * 1_000_000)
 
 
 def random_currency() -> str:

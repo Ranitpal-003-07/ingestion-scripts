@@ -19,11 +19,12 @@ Coverage (see nr_traces/catalog.py):
   - DB clients always set db_system; External clients leave it empty
   - demo-static-cdn: SERVER-only (empty External)
   - demo-edge-bff: outbound without db_system (External-only / overlap tests)
+  - Every span: custom attributes `key` + `timestamp` (µs)
 
 Usage:
   pip install -r requirements.txt
   export OTEL_EXPORTER_OTLP_ENDPOINT="https://staging.ctrlb.dev/engine/api/default"
-  export STREAM_NAME="traces_testing_sep"
+  export STREAM_NAME="traces_key_timestamp"
   python3 ingest_traces.py --rate 30 --spread 45
 """
 

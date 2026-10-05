@@ -72,6 +72,7 @@ class Biz:
     payment_method: str = field(default_factory=ids.random_payment_method)
     amount_cents: int = field(default_factory=random_amount_cents)
     user_email: str = field(default="")
+    key: str = field(default_factory=ids.random_span_key)
 
     def __post_init__(self) -> None:
         if not self.user_email:
@@ -93,6 +94,9 @@ class Biz:
                 "cart.currency": self.currency,
                 "payment.method": self.payment_method,
                 "order.amount_cents": self.amount_cents,
+                # CtrlB custom columns (also queryable as key / timestamp)
+                "key": self.key,
+                "timestamp": ids.now_timestamp_us(),
                 **(extra or {}),
             },
         )
