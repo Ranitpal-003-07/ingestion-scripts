@@ -1,0 +1,89 @@
+[
+  {
+    "id": "service",
+    "display": "Service",
+    "group": "Common",
+    "fields": [
+      "service",
+      "service_name",
+      "service.name",
+      "app",
+      "application",
+      "attributes_app",
+      "attributes_service"
+    ],
+    "is_workload_type": true
+  },
+  {
+    "id": "k8s-cluster",
+    "display": "K8s Cluster",
+    "group": "Kubernetes",
+    "fields": [
+      "cluster",
+      "attributes_cluster",
+      "k8s_cluster",
+      "k8s_cluster_name",
+      "k8s.cluster.name",
+      "service_k8s_cluster_name",
+      "attributes_k8s_cluster_name"
+    ],
+    "is_workload_type": true
+  },
+  {
+    "id": "k8s-namespace",
+    "display": "K8s Namespace",
+    "group": "Kubernetes",
+    "fields": [
+      "namespace",
+      "attributes_namespace",
+      "k8s_namespace",
+      "k8s_namespace_name",
+      "k8s.namespace.name",
+      "service_k8s_namespace_name",
+      "attributes_k8s_namespace_name"
+    ],
+    "is_workload_type": true
+  },
+  {
+    "id": "aws-account",
+    "display": "AWS Account",
+    "group": "AWS",
+    "fields": [
+      "account",
+      "attributes_account",
+      "aws_account_id",
+      "cloud.account.id",
+      "service_cloud_account_id",
+      "attributes_aws_account_id"
+    ],
+    "is_workload_type": true
+  },
+  {
+    "id": "aws-region",
+    "display": "AWS Region",
+    "group": "AWS",
+    "fields": [
+      "region",
+      "attributes_region",
+      "aws_region",
+      "cloud.region",
+      "service_cloud_region",
+      "attributes_cloud_region"
+    ],
+    "is_workload_type": true
+  },
+  {
+    "id": "environment",
+    "display": "Environment",
+    "group": "Common",
+    "fields": [
+      "env",
+      "attributes_env",
+      "environment",
+      "deployment.environment",
+      "service_deployment_environment",
+      "attributes_deployment_environment"
+    ],
+    "is_workload_type": false
+  }
+]
