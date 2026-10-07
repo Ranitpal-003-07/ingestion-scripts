@@ -107,8 +107,10 @@ class MetricsSession:
         ]
 
     def record_all(self) -> None:
+        active_ids = {w.workload_id for w in scenarios.active_workloads()}
         for backend in self._backends:
-            backend.record()
+            if backend.workload.workload_id in active_ids:
+                backend.record()
 
     def flush(self) -> None:
         for backend in self._backends:

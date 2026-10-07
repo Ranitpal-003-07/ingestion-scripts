@@ -25,7 +25,19 @@ class Workload:
     account: str | None = None
     region: str | None = None
     prefer_errors: bool = False
+    # Log volume per tick — GROUP BY service shows relative heights.
+    logs_per_tick: int = 1
+    # If set, stop emitting this workload after N seconds from process start
+    # (shipping drops out of GROUP BY once the query window no longer covers it).
+    active_for_seconds: float | None = None
 
+
+# Process start — used for shipping's short-lived window.
+_INGEST_STARTED_AT = time.time()
+
+# Shipping stops after this many seconds so its GROUP BY bucket disappears
+# from recent-time queries while checkout/payments/auth keep flowing.
+SHIPPING_ACTIVE_SECONDS = 180.0
 
 WORKLOADS: tuple[Workload, ...] = (
     Workload(
@@ -36,22 +48,35 @@ WORKLOADS: tuple[Workload, ...] = (
         cluster="prod-us-east",
         namespace="payments",
         prefer_errors=True,
+        logs_per_tick=12,
     ),
     Workload(
-        workload_id="k8s-cart",
+        workload_id="k8s-payments",
         kind=IdentityKind.K8S,
-        service="cart",
+        service="payments",
         env="prod",
         cluster="prod-us-east",
         namespace="payments",
+        logs_per_tick=10,
     ),
     Workload(
-        workload_id="aws-checkout",
-        kind=IdentityKind.AWS,
-        service="checkout",
+        workload_id="k8s-auth",
+        kind=IdentityKind.K8S,
+        service="auth",
         env="prod",
-        account="111122223333",
-        region="us-east-1",
+        cluster="prod-us-east",
+        namespace="identity",
+        logs_per_tick=1,
+    ),
+    Workload(
+        workload_id="k8s-shipping",
+        kind=IdentityKind.K8S,
+        service="shipping",
+        env="prod",
+        cluster="prod-us-east",
+        namespace="fulfillment",
+        logs_per_tick=6,
+        active_for_seconds=SHIPPING_ACTIVE_SECONDS,
     ),
 )
 
@@ -60,10 +85,31 @@ def _micros_now() -> int:
     return int(time.time() * 1_000_000)
 
 
+def ingest_elapsed_seconds() -> float:
+    return time.time() - _INGEST_STARTED_AT
+
+
+def workload_is_active(workload: Workload) -> bool:
+    if workload.active_for_seconds is None:
+        return True
+    return ingest_elapsed_seconds() < workload.active_for_seconds
+
+
+def active_workloads() -> list[Workload]:
+    return [w for w in WORKLOADS if workload_is_active(w)]
+
+
 def build_log_record(workload: Workload) -> dict[str, Any]:
-    """Logs use app / namespace / cluster (K8s) or app / account / region (AWS)."""
+    """Logs include bare `service` for GROUP BY, plus `app` for field-alias demos."""
     is_error = workload.prefer_errors and random.random() < 0.35
+    paths = {
+        "checkout": ["/api/v1/checkout", "/api/v1/checkout/confirm"],
+        "payments": ["/api/v1/payments", "/api/v1/payments/capture"],
+        "auth": ["/api/v1/auth/login", "/api/v1/auth/token"],
+        "shipping": ["/api/v1/shipping", "/api/v1/shipping/track"],
+    }
     record: dict[str, Any] = {
+        "service": workload.service,
         "app": workload.service,
         "env": workload.env,
         "level": "error" if is_error else "info",
@@ -73,7 +119,7 @@ def build_log_record(workload: Workload) -> dict[str, Any]:
             else f"{workload.service} request handled"
         ),
         "http_method": random.choice(["GET", "POST"]),
-        "uri": random.choice(["/api/v1/checkout", "/api/v1/cart", "/api/v1/health"]),
+        "uri": random.choice(paths.get(workload.service, ["/api/v1/health"])),
         "_timestamp": _micros_now(),
         "workload_id": workload.workload_id,
     }
@@ -103,6 +149,7 @@ def build_trace_span_attributes(workload: Workload) -> dict[str, str]:
     peels that prefix (and field-aliases.correlation.json lists both spellings).
     """
     attrs = {
+        "service": workload.service,
         "app": workload.service,
         "env": workload.env,
         "workload_id": workload.workload_id,
@@ -117,9 +164,13 @@ def build_trace_span_attributes(workload: Workload) -> dict[str, str]:
 
 
 def build_trace_span_name(workload: Workload) -> str:
-    if workload.service == "checkout":
-        return "POST /pay"
-    return "GET /cart"
+    names = {
+        "checkout": "POST /checkout",
+        "payments": "POST /payments",
+        "auth": "POST /auth/login",
+        "shipping": "GET /shipping",
+    }
+    return names.get(workload.service, f"GET /{workload.service}")
 
 
 def trace_should_fail(workload: Workload) -> bool:
@@ -149,4 +200,11 @@ def metric_request_count(workload: Workload) -> int:
 
 
 def all_log_batch() -> list[dict[str, Any]]:
-    return [build_log_record(w) for w in WORKLOADS]
+    """Weighted log batch: checkout/payments high, auth low; shipping timed out."""
+    records: list[dict[str, Any]] = []
+    for workload in WORKLOADS:
+        if not workload_is_active(workload):
+            continue
+        for _ in range(max(1, workload.logs_per_tick)):
+            records.append(build_log_record(workload))
+    return records

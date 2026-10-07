@@ -96,7 +96,7 @@ class TraceSession:
 
     def emit_all(self) -> list[str]:
         ids: list[str] = []
-        for workload in scenarios.WORKLOADS:
+        for workload in scenarios.active_workloads():
             for backend in self._backends:
                 trace_id = backend.emit_workload(workload)
                 ids.append(trace_id)

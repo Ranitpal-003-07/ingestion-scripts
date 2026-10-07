@@ -50,7 +50,7 @@ def emit_tick(
     if do_metrics and metrics_session is not None:
         metrics_session.record_all()
         metrics_session.flush()
-    return len(scenarios.WORKLOADS) if do_logs else 0, n_traces
+    return len(scenarios.active_workloads()) if do_logs else 0, n_traces
 
 
 def run_once(
@@ -101,6 +101,11 @@ def run_loop(
     ticks = 0
     errors = 0
     try:
+        services = ", ".join(
+            f"{w.service}×{w.logs_per_tick}"
+            + (f" (~{int(w.active_for_seconds)}s)" if w.active_for_seconds else "")
+            for w in scenarios.WORKLOADS
+        )
         logger.info(
             "Continuous ingest started → %s org=%s "
             "(logs=%s traces=%s metrics=%s) ticks/sec=%s  Ctrl-C to stop",
@@ -111,7 +116,9 @@ def run_loop(
             config.O2_METRICS_STREAMS if do_metrics else "-",
             config.TICKS_PER_SECOND,
         )
+        logger.info("Services (logs/tick): %s", services)
         logger.info("Open UI: https://ap1.openobserve.ai  (AP1 region, not cloud.openobserve.ai)")
+        shipping_stopped_logged = False
         while not _shutdown:
             loop_start = time.time()
             for _ in range(config.TICKS_PER_SECOND):
@@ -129,10 +136,26 @@ def run_loop(
                 except Exception:
                     errors += 1
                     logger.exception("Ingest tick failed")
+            if (
+                not shipping_stopped_logged
+                and scenarios.ingest_elapsed_seconds() >= scenarios.SHIPPING_ACTIVE_SECONDS
+            ):
+                shipping_stopped_logged = True
+                logger.info(
+                    "Shipping stopped after %.0fs — GROUP BY service will drop "
+                    "shipping from recent windows while checkout/payments stay high, auth low",
+                    scenarios.SHIPPING_ACTIVE_SECONDS,
+                )
             elapsed = time.time() - loop_start
             time.sleep(max(0.0, 1.0 - elapsed))
             if ticks and ticks % 10 == 0:
-                logger.info("Running… ticks=%s errors=%s", ticks, errors)
+                active = [w.service for w in scenarios.active_workloads()]
+                logger.info(
+                    "Running… ticks=%s errors=%s active_services=%s",
+                    ticks,
+                    errors,
+                    active,
+                )
     finally:
         logger.info("Stopping… total ticks=%s errors=%s", ticks, errors)
         if trace_session is not None:
