@@ -1,0 +1,106 @@
+# OpenTelemetry Demo → CtrlB (traces + metrics + k8s logs)
+# Chart does not support helm upgrade — uninstall, then install with this file.
+
+opentelemetry-collector:
+  mode: daemonset
+  presets:
+    hostMetrics:
+      enabled: true
+    kubeletMetrics:
+      enabled: true
+    clusterMetrics:
+      enabled: true
+    kubernetesAttributes:
+      enabled: true
+    logsCollection:
+      enabled: true
+      includeCollectorLogs: false
+
+  config:
+    exporters:
+      otlphttp/ctrlb-traces:
+        endpoint: https://staging.ctrlb.dev/engine/api/default
+        headers:
+          stream-name: otel_demo_traces
+
+      # Each metric becomes its own CtrlB stream (k8s_*, system_*, …)
+      otlphttp/ctrlb-metrics:
+        endpoint: https://staging.ctrlb.dev/engine/api/default
+
+      # Container filelog → dataset `k8s`
+      otlphttp/ctrlb-logs:
+        endpoint: https://staging.ctrlb.dev/engine/api/default
+        logs_endpoint: https://staging.ctrlb.dev/engine/api/default/k8s/_otel/v1/logs
+        headers:
+          stream-name: k8s
+
+      # App OTLP logs → otel_demo_logs (kept out of `k8s`)
+      otlphttp/ctrlb-app-logs:
+        endpoint: https://staging.ctrlb.dev/engine/api/default
+        logs_endpoint: https://staging.ctrlb.dev/engine/api/default/otel_demo_logs/_otel/v1/logs
+        headers:
+          stream-name: otel_demo_logs
+
+    receivers:
+      kubeletstats:
+        auth_type: serviceAccount
+        collection_interval: 20s
+        endpoint: ${env:K8S_NODE_IP}:10250
+        insecure_skip_verify: true
+
+    processors:
+      resource:
+        attributes:
+          - key: service.instance.id
+            from_attribute: k8s.pod.uid
+            action: insert
+          - key: k8s.cluster.name
+            value: minikube
+            action: upsert
+
+      # Dashboard fields: logtag + flat k8s_cluster_name
+      transform/k8s_logs:
+        error_mode: ignore
+        log_statements:
+          - context: log
+            statements:
+              - set(log.attributes["logtag"], "F") where log.attributes["logtag"] == nil
+              - set(log.attributes["k8s.cluster.name"], resource.attributes["k8s.cluster.name"]) where resource.attributes["k8s.cluster.name"] != nil
+
+    service:
+      pipelines:
+        traces:
+          exporters: [span_metrics, otlphttp/ctrlb-traces]
+        metrics:
+          exporters: [otlphttp/ctrlb-metrics]
+        logs:
+          receivers: [file_log]
+          processors:
+            - k8s_attributes
+            - memory_limiter
+            - resource_detection
+            - resource
+            - transform/k8s_logs
+            - transform/sanitize_logs
+          exporters: [otlphttp/ctrlb-logs]
+        logs/app:
+          receivers: [otlp]
+          processors:
+            - k8s_attributes
+            - memory_limiter
+            - resource_detection
+            - resource
+            - transform/sanitize_logs
+          exporters: [otlphttp/ctrlb-app-logs]
+
+jaeger:
+  enabled: false
+
+prometheus:
+  enabled: false
+
+grafana:
+  enabled: false
+
+opensearch:
+  enabled: false
